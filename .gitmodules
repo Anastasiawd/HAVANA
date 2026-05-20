@@ -1,0 +1,3 @@
+[submodule "fast_system/model/lingbot-depth"]
+	path = fast_system/model/lingbot-depth
+	url = https://github.com/Robbyant/lingbot-depth

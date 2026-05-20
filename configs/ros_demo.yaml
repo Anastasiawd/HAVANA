@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - model: nomad
+  - data: default
+
+# output settings
+output_dir: ./outputs/ros_demo
+save_waypoints: false
+visualize: false
+
+# device
+device: cuda
+
+# inference
+waypoint_index: 2
+num_samples: 8
+
+# ROS 2 topic settings (bag is played separately via `ros2 bag play`)
+ros:
+  image_topic: /camera/color/image_raw    # image topic to subscribe to
+  camera_info_topic: /camera/color/camera_info  # CameraInfo topic for intrinsics
+  frame_id: map                # TF frame for rviz2 markers
+  traj_viz_scale: 100.0         # pixels-per-metre for trajectory overlay (fallback only)
+  camera_height: 1.6           # camera height above ground plane (m)
+  camera_pitch_deg: 0.0       # camera downward pitch angle (degrees, >0 = looking down)
+  metric_waypoint_spacing: 0.25  # ViNT waypoint→metres scale (0.25 for default training)

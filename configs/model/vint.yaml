@@ -1,0 +1,26 @@
+# ViNT model configuration
+
+model_type: vint
+
+# checkpoint
+ckpt_path: ${oc.env:HOME}/ffnav/visualnav-transformer/deployment/model_weights/vint.pth
+config_path: null
+
+# architecture
+obs_encoder: efficientnet-b0
+obs_encoding_size: 512
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+late_fusion: false
+
+# action output
+len_traj_pred: 5
+learn_angle: true
+normalize: true
+
+# context
+context_size: 5
+
+# image
+image_size: [85, 64]          # [width, height]

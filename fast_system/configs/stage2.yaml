@@ -1,0 +1,81 @@
+seed: 5
+device: cuda
+
+stage1:
+  checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage1.pt
+
+flownav:
+  checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/flownav.pth
+
+model:
+  encoding_size: 256
+  context_size: 3
+  z_dim: 128
+  action_dim: 2
+  action_stats:
+    min: [-2.5, -4.0]
+    max: [5.0, 4.0]
+  vision_encoder:
+    obs_encoder: efficientnet-b0
+    obs_encoding_size: 256
+    mha_num_attention_heads: 4
+    mha_num_attention_layers: 4
+    mha_ff_dim_factor: 4
+    depth_proj_dim: 384
+    depth_pool_dim: 64
+    dropout: 0.0
+    lingbot_depth:
+      enabled: true
+      checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/lingbot-depth-pretrain-vitl-14-v0p5.pt
+      resolution_level: 5
+      num_tokens: null
+      default_depth: 0.0
+      use_fp16: true
+      freeze: true
+  noise_pred_net:
+    diffusion_step_embed_dim: 256
+    down_dims: [64, 128, 256]
+    kernel_size: 3
+    n_groups: 8
+    cond_predict_scale: false
+
+scand_data:
+  train_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_train_index.jsonl
+  val_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_val_index.jsonl
+  obs_image_size: 256
+  goal_image_size: 256
+  action_horizon: 16
+  fast_stride_frames: 4
+  fast_offsets: [0, 4, 8, 12]
+  return_async_steps: true
+  metric_waypoint_spacing: 0.38
+  normalize_actions: true
+  allow_context_padding: true
+  frame_tolerance_ns: 250000000
+  dtype: float32
+  cache_readers: true
+  max_samples: null
+
+dataloader:
+  batch_size: 8
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+  timeout: 120
+
+training:
+  output_dir: /home/wangdzh/ffnav/havana/fast_system/checkpoints/stage2
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.05
+  amp: true
+  grad_clip: 1.0
+  grad_accum_steps: 4
+  goal_mask_prob: 0.5
+  distance_loss_weight: 0.0001
+  log_interval: 20
+  progress: true
+  tensorboard: true
+  tensorboard_dir: ${training.output_dir}/tb

@@ -1,0 +1,38 @@
+# FlowNav model config
+model_type: flow
+
+# checkpoint (FlowNav weights)
+ckpt_path: /home/wangdzh/ffnav/visualnav-transformer/flownav/weights/flownav.pth
+
+# architecture
+vision_encoder: nomad_vint
+encoding_size: 256
+obs_encoder: efficientnet-b0
+cond_predict_scale: false
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+down_dims: [64, 128, 256]
+
+# context / image / trajectory
+context_size: 3
+image_size: [96, 96]  # [W, H]
+len_traj_pred: 8
+learn_angle: false
+
+# flow matching inference
+flow_steps: 10
+flow_solver: euler
+
+# depth branch — use Depth-Anything-3 (DA3) instead of DA-v2
+depth:
+  use_da3: true
+  da3_pretrained: "depth-anything/DA3NESTED-GIANT-LARGE"
+  da3_branch: metric          # "metric" (ViT-L, 1024-d) or "giant" (ViT-G, 3072-d)
+  pool_dim: 64
+  # Fields below are only used when use_da3 is false (fallback to DA-v2)
+  depth_encoder: vits
+  dino_layer_idx:
+    vits: [2, 5, 8, 11]
+  out_dim:
+    vits: 384

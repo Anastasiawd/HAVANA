@@ -1,0 +1,16 @@
+defaults:
+  - _self_
+  - model: flow
+  - data: default
+
+# output settings
+output_dir: ./outputs
+save_waypoints: true          # save waypoints to a .npy file
+visualize: true               # plot waypoints on a figure
+
+# device
+device: cuda                  # cuda / cpu
+
+# inference
+waypoint_index: 2             # which waypoint to select for control (0-indexed)
+num_samples: 8                # number of diffusion samples (NoMaD only)

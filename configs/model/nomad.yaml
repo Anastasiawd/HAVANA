@@ -1,0 +1,34 @@
+# NoMaD model configuration
+# mirrors train/config/nomad.yaml but only the inference-relevant fields
+
+model_type: nomad
+
+# checkpoint
+ckpt_path: ${oc.env:HOME}/ffnav/visualnav-transformer/deployment/model_weights/nomad.pth
+config_path: null  # not needed; all params are here
+
+# vision encoder
+vision_encoder: nomad_vint
+encoding_size: 256
+obs_encoder: efficientnet-b0
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+
+# noise pred net (conditional UNet)
+down_dims: [64, 128, 256]
+cond_predict_scale: false
+
+# diffusion
+num_diffusion_iters: 10
+
+# action output
+len_traj_pred: 8
+learn_angle: false
+normalize: true
+
+# context
+context_size: 3
+
+# image
+image_size: [96, 96]          # [width, height]
