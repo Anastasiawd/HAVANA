@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
                         "fed to Stage-1 at each timestep. Matches training (16 frames @ 4 fps = 4 s).")
     p.add_argument("--max-frames", type=int, default=None,
                    help="Truncate input to first N frames (debug / speed).")
-    p.add_argument("--target-fps", type=float, default=4.0,
+    p.add_argument("--target-fps", type=float, default=5.8,
                    help="Resample the input to this fps before running the pipeline. "
                         "Stage-2 was trained at 4 fps; matching this avoids OOD obs context. "
                         "Set to 0 to keep the source fps unchanged.")
