@@ -44,6 +44,9 @@ class Video2WorldCondition(Text2WorldCondition):
     gt_frames: Optional[torch.Tensor] = None
     condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None
     num_conditional_frames_B: Optional[torch.Tensor] = None
+    crossattn_emb_preprojected: bool = False
+    waypoints_norm: Optional[torch.Tensor] = None
+    waypoint_condition_mask: Optional[torch.Tensor] = None
 
     def set_video_condition(
         self,

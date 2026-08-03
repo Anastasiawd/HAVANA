@@ -77,8 +77,10 @@ class QwenModel(VLMBaseModel):
         self.vocab_size = model_config.vocab_size
         self.lm_head = nn.Linear(model_config.hidden_size, model_config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here]
+        self.world_mesh = None
+        self.parallel_dims = None
 
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() and model_config.use_fsdp2:
             self.world_mesh, self.parallel_dims = init_mesh(model_config)
             parallelize_qwen(self, self.world_mesh, self.parallel_dims, model_config)
             self.model.set_cp_mesh(self.cp_mesh)
@@ -169,21 +171,23 @@ class QwenModel(VLMBaseModel):
 
     @property
     def cp_mesh(self):
-        if not torch.distributed.is_initialized():
+        world_mesh = getattr(self, "world_mesh", None)
+        if not torch.distributed.is_initialized() or world_mesh is None:
             return None
         # when none of the parallelisms are enabled, the world_mesh.mesh_dim_names is None
-        if self.world_mesh.mesh_dim_names is not None and "cp" in self.world_mesh.mesh_dim_names:
-            return self.world_mesh["cp"]
+        if world_mesh.mesh_dim_names is not None and "cp" in world_mesh.mesh_dim_names:
+            return world_mesh["cp"]
         else:
             return None
 
     @property
     def tp_mesh(self):
-        if not torch.distributed.is_initialized():
+        world_mesh = getattr(self, "world_mesh", None)
+        if not torch.distributed.is_initialized() or world_mesh is None:
             return None
         # when none of the parallelisms are enabled, the world_mesh.mesh_dim_names is None
-        if self.world_mesh.mesh_dim_names is not None and "tp" in self.world_mesh.mesh_dim_names:
-            return self.world_mesh["tp"]
+        if world_mesh.mesh_dim_names is not None and "tp" in world_mesh.mesh_dim_names:
+            return world_mesh["tp"]
         else:
             return None
 

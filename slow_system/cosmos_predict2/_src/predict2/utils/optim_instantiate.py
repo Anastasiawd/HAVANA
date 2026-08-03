@@ -37,26 +37,52 @@ def get_regular_param_group(net: nn.Module):
 
 
 def get_base_optimizer(
-    model: nn.Module,
-    lr: float,
-    weight_decay: float,
+    model: nn.Module | None = None,
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
     optim_type: str = "adamw",
+    params=None,
     **kwargs,
 ) -> torch.optim.Optimizer:
-    net_decay_param, net_nodecay_param = get_regular_param_group(model)
-
-    num_decay_params = sum(p.numel() for p in net_decay_param)
-    num_nodecay_params = sum(p.numel() for p in net_nodecay_param)
-    net_param_total = num_decay_params + num_nodecay_params
+    if params is None:
+        if model is None:
+            raise ValueError("get_base_optimizer requires either model or params")
+        net_decay_param, net_nodecay_param = get_regular_param_group(model)
+        param_group = [
+            {
+                "params": net_decay_param + net_nodecay_param,
+                "lr": lr,
+                "weight_decay": weight_decay,
+            },
+        ]
+        num_decay_params = sum(p.numel() for p in net_decay_param)
+        num_nodecay_params = sum(p.numel() for p in net_nodecay_param)
+        net_param_total = num_decay_params + num_nodecay_params
+    else:
+        if isinstance(params, (list, tuple)) and params and isinstance(params[0], dict):
+            param_group = list(params)
+            for group in param_group:
+                group.setdefault("lr", lr)
+                group.setdefault("weight_decay", weight_decay)
+            net_param_total = sum(
+                p.numel()
+                for group in param_group
+                for p in group.get("params", [])
+                if getattr(p, "requires_grad", True)
+            )
+        else:
+            param_group = [
+                {
+                    "params": list(params),
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                },
+            ]
+            net_param_total = sum(
+                p.numel() for p in param_group[0]["params"] if getattr(p, "requires_grad", True)
+            )
     log.critical(f"total num parameters : {net_param_total:,}")
 
-    param_group = [
-        {
-            "params": net_decay_param + net_nodecay_param,
-            "lr": lr,
-            "weight_decay": weight_decay,
-        },
-    ]
 
     if optim_type == "adamw":
         opt_cls = torch.optim.AdamW

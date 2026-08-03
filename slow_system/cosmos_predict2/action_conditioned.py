@@ -253,9 +253,6 @@ def inference(
         # pyrefly: ignore  # bad-argument-type
         context_parallel_size=setup_args.context_parallel_size,
         config_file=setup_args.config_file,
-        offload_diffusion_model=setup_args.offload_diffusion_model,
-        offload_text_encoder=setup_args.offload_text_encoder,
-        offload_tokenizer=setup_args.offload_tokenizer,
     )
 
     mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))

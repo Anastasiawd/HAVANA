@@ -43,9 +43,6 @@ class VideoDataset(Dataset):
         prompt_type: str | None = None,  # "long", "short", "medium", or None for auto
         caption_format: str = "auto",  # "text", "json", or "auto"
         video_paths: Optional[list[str]] = None,
-        load_text_embeddings: bool = True,
-        random_clip: bool = True,
-        target_fps: Optional[float] = None,
     ) -> None:
         """Dataset class for loading image-text-to-video generation data.
 
@@ -57,7 +54,6 @@ class VideoDataset(Dataset):
                                      If None, uses the first available prompt type.
                                      Only applicable when using JSON format.
             caption_format (str): Caption format - "text", "json", or "auto" to detect automatically
-            target_fps (float | None): Optional FPS to resample clips to before handing them to the model.
 
         Returns dict with:
             - video: RGB frames tensor [T,C,H,W]
@@ -69,15 +65,9 @@ class VideoDataset(Dataset):
         self.sequence_length = num_frames
         self.prompt_type = prompt_type
         self.caption_format = caption_format
-        self.load_text_embeddings = load_text_embeddings
-        self.random_clip = random_clip
-        self.target_fps = float(target_fps) if target_fps is not None else None
-        if self.target_fps is not None and self.target_fps <= 0:
-            raise ValueError(f"target_fps must be positive when provided, got {target_fps}")
 
         # Determine caption format and directory
         self._setup_caption_format()
-        self.embeddings_dir = os.path.join(self.dataset_dir, "embeddings")
 
         video_dir = os.path.join(self.dataset_dir, "videos")
 
@@ -97,62 +87,30 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.video_paths)
 
-    def _sample_frame_ids(self, total_frames: int, source_fps: float, video_path: str) -> tuple[list[int], float]:
-        if self.target_fps is None or source_fps <= self.target_fps:
-            stride = 1.0
-            effective_fps = source_fps
-        else:
-            stride = source_fps / self.target_fps
-            effective_fps = self.target_fps
-
-        clip_span = int(np.ceil((self.sequence_length - 1) * stride)) + 1
-        if total_frames < clip_span:
-            raise ValueError(
-                f"Video {video_path} has only {total_frames} frames, but sampling {self.sequence_length} frames at "
-                f"{effective_fps:.2f} fps from source fps {source_fps:.2f} requires at least {clip_span} frames."
-            )
-
-        max_start_idx = total_frames - clip_span
-        if max_start_idx == 0:
-            start_frame = 0
-        elif self.random_clip:
-            # Random clip sampling is useful for training, but validation and
-            # 1-sample overfit runs should usually disable it for determinism.
-            start_frame = np.random.randint(0, max_start_idx + 1)
-        else:
-            start_frame = 0
-
-        frame_offsets = np.round(np.arange(self.sequence_length, dtype=np.float64) * stride).astype(np.int64)
-        frame_ids = (start_frame + frame_offsets).tolist()
-        return frame_ids, effective_fps
-
     def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
-        resolved_video_path = os.path.realpath(video_path)
-        if not os.path.exists(video_path):
-            if os.path.islink(video_path):
-                raise FileNotFoundError(
-                    f"Video symlink {video_path} points to a missing target: {resolved_video_path}. "
-                    "Either make the source dataset available at that path or rebuild the VLN dataset with copied videos."
-                )
-            raise FileNotFoundError(
-                f"Video file not found: {video_path}. Make sure training is launched from the repo root "
-                "or pass an absolute dataset_dir."
-            )
-
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
-        try:
-            fps = float(vr.get_avg_fps())
-        except Exception:  # failed to read FPS, assume it is 16
-            fps = 16.0
-        if not np.isfinite(fps) or fps <= 0:
-            fps = 16.0
+        if total_frames < self.sequence_length:
+            raise ValueError(
+                f"Video {video_path} has only {total_frames} frames, "
+                f"at least {self.sequence_length} frames are required."
+            )
 
-        frame_ids, effective_fps = self._sample_frame_ids(total_frames, fps, video_path)
+        # randomly sample a sequence of frames
+        max_start_idx = total_frames - self.sequence_length
+        start_frame = np.random.randint(0, max_start_idx)
+        end_frame = start_frame + self.sequence_length
+        frame_ids = np.arange(start_frame, end_frame).tolist()
+
         frame_data = vr.get_batch(frame_ids).asnumpy()
         vr.seek(0)  # set video reader point back to 0 to clean up cache
+
+        try:
+            fps = vr.get_avg_fps()
+        except Exception:  # failed to read FPS, assume it is 16
+            fps = 16
         del vr  # delete the reader to avoid memory leak
-        return frame_data, effective_fps
+        return frame_data, fps
 
     def _setup_caption_format(self) -> None:
         """Determine the caption format and set up the caption directory."""
@@ -224,26 +182,6 @@ class VideoDataset(Dataset):
             log.warning(f"Failed to read JSON caption file {json_path}: {e}")
             return ""
 
-    def _load_text_embedding(self, embedding_path: Path) -> Optional[torch.Tensor]:
-        """Load a precomputed text embedding if available."""
-        if not self.load_text_embeddings or not embedding_path.exists():
-            return None
-
-        try:
-            embedding = torch.load(embedding_path, map_location="cpu", weights_only=False)
-            if isinstance(embedding, dict):
-                embedding = embedding.get("t5_text_embeddings", embedding.get("embedding"))
-            if embedding is None:
-                raise ValueError(f"No tensor found in {embedding_path}")
-            if not isinstance(embedding, torch.Tensor):
-                embedding = torch.as_tensor(embedding)
-            if embedding.ndim == 3 and embedding.shape[0] == 1:
-                embedding = embedding.squeeze(0)
-            return embedding
-        except Exception as e:
-            log.warning(f"Failed to read text embedding file {embedding_path}: {e}")
-            return None
-
     def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
         frames, fps = self._load_video(video_path)
         frames = frames.astype(np.uint8)
@@ -272,18 +210,6 @@ class VideoDataset(Dataset):
             data["video"] = video
             data["ai_caption"] = caption
 
-            embedding_path = Path(self.embeddings_dir) / f"{video_basename}.pt"
-            text_embedding = self._load_text_embedding(embedding_path)
-            if text_embedding is not None:
-                data["t5_text_embeddings"] = text_embedding
-                data["t5_text_mask"] = torch.ones(text_embedding.shape[0], dtype=torch.int64)
-            elif self.load_text_embeddings:
-                raise FileNotFoundError(
-                    "Missing precomputed text embedding for "
-                    f"{video_basename}: expected {embedding_path}. "
-                    "Run scripts/precompute_vln_reason1_embeddings.py for this dataset split."
-                )
-
             _, _, h, w = video.shape
 
             data["fps"] = fps
@@ -299,11 +225,6 @@ class VideoDataset(Dataset):
                 f"{traceback.format_exc()}",
                 rank0_only=False,
             )
-            # Permanent dataset/configuration issues should fail fast instead of
-            # recursively resampling forever. Resampling is only useful for
-            # transient per-file decode failures in multi-sample datasets.
-            if isinstance(e, FileNotFoundError) or len(self.video_paths) <= 1:
-                raise
             # Randomly sample another video
             return self[np.random.randint(len(self.video_paths))]
 
@@ -351,13 +272,13 @@ def get_generic_dataloader(
     )
 
 
-def get_sampler(dataset, shuffle: bool = True) -> DistributedSampler:
+def get_sampler(dataset) -> DistributedSampler:
     """Create a distributed sampler for the dataset."""
     return DistributedSampler(
         dataset,
         num_replicas=parallel_state.get_data_parallel_world_size(),
         rank=parallel_state.get_data_parallel_rank(),
-        shuffle=shuffle,
+        shuffle=True,
         seed=0,
     )
 

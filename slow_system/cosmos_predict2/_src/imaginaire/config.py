@@ -419,6 +419,9 @@ class TrainerConfig:
     grad_scaler_args: dict = attrs.field(factory=lambda: dict(enabled=False))
     # Maximum number of iterations to train the model.
     max_iter: int = 999999999
+    # Optional epoch-based cap resolved from the instantiated train loader.
+    # None preserves the legacy iteration-only behavior.
+    max_epochs: float | None = None
     # Maximum number of iterations to validate the model. If None, validate on the entire dataset.
     max_val_iter: int | None = None
     # How often we log the training stats.
@@ -427,6 +430,9 @@ class TrainerConfig:
     run_validation: bool = True
     # How often we evaluate on the validation set.
     validation_iter: int = 999999999
+    # Optional validation cadence expressed as a fraction of one train epoch.
+    # For example, 0.5 validates twice per effective epoch.
+    validation_epoch_interval: float | None = None
     # Whether to run the validation on the start of the training.
     run_validation_on_start: bool = False
     # Kill the process after N seconds since the last iteration (usually means dead job).

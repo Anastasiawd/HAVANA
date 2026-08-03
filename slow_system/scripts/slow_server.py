@@ -42,9 +42,15 @@ from PIL import Image
 # Make slow_system imports work without an editable install.
 _SLOW_ROOT = Path(__file__).resolve().parents[2] / "slow_system"
 _SLOW_OSS_ROOT = _SLOW_ROOT / "packages" / "cosmos-oss"
-for p in (_SLOW_ROOT, _SLOW_OSS_ROOT):
-    if p.is_dir() and str(p) not in sys.path:
-        sys.path.append(str(p))
+# The Cosmos venv may contain an editable ``cosmos_predict2`` install.  Put
+# this repository's slow_system sources first so the server cannot silently
+# import a different checkout.
+for p in reversed((_SLOW_ROOT, _SLOW_OSS_ROOT)):
+    if p.is_dir():
+        source_path = str(p)
+        while source_path in sys.path:
+            sys.path.remove(source_path)
+        sys.path.insert(0, source_path)
 
 
 LOG = logging.getLogger("havana.slow.server")
@@ -124,12 +130,14 @@ def _strip_to_rgb_u8(arr: np.ndarray) -> np.ndarray:
 
 
 class CosmosSlowEngine:
-    """Owns the LoRA Video2World pipe; one instance per process."""
+    """Owns the standard ``cosmos_predict2.inference.Inference`` pipe."""
 
     def __init__(self, cfg: SlowServerConfig):
         self.cfg = cfg
         self._h, self._w = self._parse_resolution(cfg.resolution)
+        self._inference = None
         self._pipe = None
+        self._negative_prompt = None
         self._init_pipe()
 
     @staticmethod
@@ -141,11 +149,32 @@ class CosmosSlowEngine:
 
     def _init_pipe(self) -> None:
         t0 = time.time()
+        import cosmos_predict2.inference as canonical_inference  # noqa: WPS433
+        import cosmos_predict2._src.predict2.inference.video2world as video2world_inference  # noqa: WPS433
         from cosmos_oss.init import init_environment  # noqa: WPS433
-        from cosmos_predict2.inference_lora import LoraVideo2WorldInference  # noqa: WPS433
+        from cosmos_predict2.config import (  # noqa: WPS433
+            DEFAULT_MODEL_KEY,
+            DEFAULT_NEGATIVE_PROMPT,
+            SetupArguments,
+        )
+
+        expected_inference = (_SLOW_ROOT / "cosmos_predict2" / "inference.py").resolve()
+        loaded_inference = Path(canonical_inference.__file__).resolve()
+        expected_video2world = (
+            _SLOW_ROOT / "cosmos_predict2" / "_src" / "predict2" / "inference" / "video2world.py"
+        ).resolve()
+        loaded_video2world = Path(video2world_inference.__file__).resolve()
+        if loaded_inference != expected_inference or loaded_video2world != expected_video2world:
+            raise RuntimeError(
+                "slow server imported Cosmos from the wrong source tree: "
+                f"inference={loaded_inference}, video2world={loaded_video2world}; "
+                f"expected inference={expected_inference}, video2world={expected_video2world}"
+            )
+        LOG.info("canonical inference source: %s", loaded_inference)
+        LOG.info("video2world source      : %s", loaded_video2world)
+        Inference = canonical_inference.Inference
 
         init_environment()
-        os.environ.setdefault("COSMOS_PREDICT2_LORA_AUTO_OFFLOAD", "1")
 
         ckpt_root = Path(self.cfg.checkpoint_path).expanduser().resolve()
         ckpt = ckpt_root / self.cfg.checkpoint_filename if ckpt_root.is_dir() else ckpt_root
@@ -155,17 +184,30 @@ class CosmosSlowEngine:
         config_file = self.cfg.config_file or "cosmos_predict2/_src/predict2/configs/video2world/config.py"
         LOG.info("loading cosmos pipe: experiment=%s ckpt=%s", self.cfg.experiment, ckpt)
 
-        self._pipe = LoraVideo2WorldInference(
-            experiment_name=self.cfg.experiment,
-            ckpt_path=str(ckpt),
-            s3_credential_path="",
-            context_parallel_size=int(os.environ.get("WORLD_SIZE", "1")),
-            config_file=config_file,
-            experiment_opts=[],
-            offload_diffusion_model=self.cfg.offload_diffusion_model,
-            offload_text_encoder=self.cfg.offload_text_encoder,
-            offload_tokenizer=self.cfg.offload_tokenizer,
+        # Construct the pipe through the exact setup path used by
+        # cosmos_predict2/inference.py.  In particular, do not substitute a
+        # LoRA-specific inference wrapper here: the checkpoint and experiment
+        # are interpreted by the canonical Inference implementation.
+        setup_args = SetupArguments.model_validate(
+            {
+                "output_dir": "/tmp/havana-slow-inference",
+                # SetupArguments.validate_model requires the model name even
+                # though the field itself has a default.  This is the same
+                # default model selected by cosmos_predict2.inference.py.
+                "model": DEFAULT_MODEL_KEY.name,
+                "checkpoint_path": str(ckpt),
+                "experiment": self.cfg.experiment,
+                "config_file": config_file,
+                "context_parallel_size": int(os.environ.get("WORLD_SIZE", "1")),
+                "offload_diffusion_model": self.cfg.offload_diffusion_model,
+                "offload_text_encoder": self.cfg.offload_text_encoder,
+                "offload_tokenizer": self.cfg.offload_tokenizer,
+                "disable_guardrails": self.cfg.disable_guardrails,
+            }
         )
+        self._inference = Inference(setup_args)
+        self._pipe = self._inference.pipe
+        self._negative_prompt = DEFAULT_NEGATIVE_PROMPT
         try:
             self._req_frames = int(self._pipe.model.tokenizer.get_pixel_num_frames(self._pipe.model.config.state_t))
         except Exception:  # noqa: BLE001
@@ -231,6 +273,15 @@ class CosmosSlowEngine:
             except Exception:  # noqa: BLE001
                 pass
 
+        if self.cfg.offload_text_encoder:
+            offload_reason = getattr(model, "offload_reason_conditioner_for_inference", None)
+            if callable(offload_reason):
+                try:
+                    offload_reason()
+                    moved.append("trajectory_reason_conditioner")
+                except Exception:  # noqa: BLE001
+                    pass
+
         # 2. Tokenizer encoder + decoder.
         tok = getattr(model, "tokenizer", None)
         if tok is not None:
@@ -289,6 +340,7 @@ class CosmosSlowEngine:
                 num_latent_conditional_frames=int(self.cfg.num_conditional_frames),
                 resolution=self.cfg.resolution,
                 seed=int(seed),
+                negative_prompt=self._negative_prompt,
                 num_steps=int(self.cfg.num_steps),
             )
             # sampled: (1, 3, T, H, W) in [-1, 1]
@@ -408,6 +460,14 @@ def _parse_args() -> argparse.Namespace:
                    help="H,W override (default 192,320)")
     p.add_argument("--num-steps", type=int, default=None)
     p.add_argument("--guidance", type=int, default=None)
+    p.add_argument("--disable-guardrails", action="store_true", default=None,
+                   help="disable text and video guardrails")
+    p.add_argument("--offload-text-encoder", action="store_true", default=None,
+                   help="offload the text encoder between inference stages")
+    p.add_argument("--offload-tokenizer", action="store_true", default=None,
+                   help="offload tokenizer encoder/decoder between inference stages")
+    p.add_argument("--offload-diffusion-model", action="store_true", default=None,
+                   help="offload the diffusion model between inference stages")
     return p.parse_args()
 
 
@@ -425,6 +485,14 @@ def main() -> int:
         cfg.num_steps = int(args.num_steps)
     if args.guidance is not None:
         cfg.guidance = int(args.guidance)
+    if args.disable_guardrails is not None:
+        cfg.disable_guardrails = bool(args.disable_guardrails)
+    if args.offload_text_encoder is not None:
+        cfg.offload_text_encoder = bool(args.offload_text_encoder)
+    if args.offload_tokenizer is not None:
+        cfg.offload_tokenizer = bool(args.offload_tokenizer)
+    if args.offload_diffusion_model is not None:
+        cfg.offload_diffusion_model = bool(args.offload_diffusion_model)
 
     LOG.info("=" * 72)
     LOG.info("Slow RPC server starting")
@@ -432,6 +500,9 @@ def main() -> int:
     LOG.info("  experiment     : %s", cfg.experiment)
     LOG.info("  resolution     : %s", cfg.resolution)
     LOG.info("  num_steps      : %d", cfg.num_steps)
+    LOG.info("  guardrails     : %s", "disabled" if cfg.disable_guardrails else "enabled")
+    LOG.info("  offload        : text=%s tokenizer=%s diffusion=%s",
+             cfg.offload_text_encoder, cfg.offload_tokenizer, cfg.offload_diffusion_model)
     LOG.info("  serve          : %s", args.serve)
     LOG.info("=" * 72)
 

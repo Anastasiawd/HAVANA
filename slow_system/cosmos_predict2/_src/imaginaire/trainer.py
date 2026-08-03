@@ -15,8 +15,10 @@
 
 import functools
 import inspect
+import math
 import os
 import signal
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -39,6 +41,32 @@ from cosmos_predict2._src.imaginaire.model import ImaginaireModel
 from cosmos_predict2._src.imaginaire.utils import callback, distributed, ema, log, misc
 from cosmos_predict2._src.imaginaire.utils.checkpointer import Checkpointer
 from cosmos_predict2._src.imaginaire.utils.misc import StragglerDetectorV2
+
+
+def _resolve_epoch_schedule(
+    *,
+    configured_max_iter: int,
+    configured_validation_iter: int,
+    max_epochs: Optional[float],
+    validation_epoch_interval: Optional[float],
+    steps_per_epoch: Optional[int],
+) -> tuple[int, int]:
+    """Resolve optional epoch-based settings without mutating the frozen config."""
+    max_iter = configured_max_iter
+    validation_iter = configured_validation_iter
+    if max_epochs is None and validation_epoch_interval is None:
+        return max_iter, validation_iter
+    if steps_per_epoch is None or steps_per_epoch <= 0:
+        raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+    if max_epochs is not None:
+        if max_epochs <= 0:
+            raise ValueError(f"max_epochs must be positive, got {max_epochs}")
+        max_iter = min(max_iter, math.ceil(max_epochs * steps_per_epoch))
+    if validation_epoch_interval is not None:
+        if validation_epoch_interval <= 0:
+            raise ValueError(f"validation_epoch_interval must be positive, got {validation_epoch_interval}")
+        validation_iter = max(1, round(validation_epoch_interval * steps_per_epoch))
+    return max_iter, validation_iter
 
 
 class ImaginaireTrainer:
@@ -225,6 +253,33 @@ class ImaginaireTrainer:
         self.callbacks.on_optimizer_init_end()
         # Load the model checkpoint and get the starting iteration number.
         iteration = self.checkpointer.load(model, optimizer, scheduler, grad_scaler)
+        try:
+            loader_batches_per_epoch = len(dataloader_train)
+        except (TypeError, AttributeError):
+            loader_batches_per_epoch = None
+        resolve_epoch_schedule = (
+            self.config.trainer.max_epochs is not None or self.config.trainer.validation_epoch_interval is not None
+        )
+        steps_per_epoch = loader_batches_per_epoch if resolve_epoch_schedule else None
+        max_iter, validation_iter = _resolve_epoch_schedule(
+            configured_max_iter=self.config.trainer.max_iter,
+            configured_validation_iter=self.config.trainer.validation_iter,
+            max_epochs=self.config.trainer.max_epochs,
+            validation_epoch_interval=self.config.trainer.validation_epoch_interval,
+            steps_per_epoch=steps_per_epoch,
+        )
+        self.resolved_max_iter = max_iter
+        self.resolved_validation_iter = validation_iter
+        if self.config.trainer.max_epochs is not None:
+            log.info(
+                f"Resolved max_epochs={self.config.trainer.max_epochs} with "
+                f"{steps_per_epoch} steps/epoch to max_iter={max_iter}"
+            )
+        if self.config.trainer.validation_epoch_interval is not None:
+            log.info(
+                f"Resolved validation_epoch_interval={self.config.trainer.validation_epoch_interval} with "
+                f"{steps_per_epoch} steps/epoch to validation_iter={validation_iter}"
+            )
         grad_accum_iter = 0
         log.critical(f"Distributed parallelism mode: {self.config.trainer.distributed_parallelism}")
         if self.config.trainer.distributed_parallelism == "ddp":
@@ -241,11 +296,29 @@ class ImaginaireTrainer:
         if self.config.trainer.run_validation and iteration == 0 and self.config.trainer.run_validation_on_start:
             self.validate(model, dataloader_val, iteration=iteration)
         _end_training = False
+        if loader_batches_per_epoch:
+            epoch = iteration // loader_batches_per_epoch
+            resume_batch_offset = iteration % loader_batches_per_epoch
+        else:
+            epoch = 0
+            resume_batch_offset = 0
+        first_loader_epoch = True
         with (
             maybe_enable_profiling(self.config, global_step=iteration) as torch_profiler,
             maybe_enable_memory_snapshot(self.config, global_step=iteration) as memory_profiler,
         ):
             while True:
+                sampler = getattr(dataloader_train, "sampler", None)
+                if hasattr(sampler, "set_start_index"):
+                    # Keep epoch/restart handling scoped to samplers that opt in
+                    # to the exact-resume contract. Existing official samplers
+                    # retain the trainer behavior they had before this feature.
+                    if hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(epoch)
+                    batch_offset = resume_batch_offset if first_loader_epoch else 0
+                    batch_size = getattr(dataloader_train, "batch_size", 1) or 1
+                    sampler.set_start_index(batch_offset * batch_size)
+                first_loader_epoch = False
                 dataloader_train_iter = iter(dataloader_train)
                 while True:
                     self.callbacks.on_before_dataloading(iteration)
@@ -270,7 +343,7 @@ class ImaginaireTrainer:
                     finally:
                         self.callbacks.on_after_dataloading(iteration)
                     # If max_iter is reached, exit the training loop.
-                    if iteration >= self.config.trainer.max_iter:
+                    if iteration >= max_iter:
                         _end_training = True
                         break
                     # Move all tensors in the data batch to GPU device.
@@ -304,7 +377,7 @@ class ImaginaireTrainer:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
                     # Validation.
-                    if self.config.trainer.run_validation and iteration % self.config.trainer.validation_iter == 0:
+                    if self.config.trainer.run_validation and iteration % validation_iter == 0:
                         self.validate(model, dataloader_val, iteration=iteration)
                     # This iteration is successful; reset the timeout signal.
                     signal.alarm(self.config.trainer.timeout_period)
@@ -315,6 +388,7 @@ class ImaginaireTrainer:
                         memory_profiler.step()
                 if _end_training:
                     break
+                epoch += 1
         log.success("Done with training.")
         if iteration % self.config.checkpoint.save_iter != 0:
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
@@ -368,9 +442,9 @@ class ImaginaireTrainer:
                     loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
                     loss_scaled.backward()
                     if self.config.trainer.distributed_parallelism == "ddp":
-                        model_ddp.module.on_after_backward()
+                        model_ddp.module.on_after_backward(iteration=iteration)
                     else:
-                        model_ddp.on_after_backward()
+                        model_ddp.on_after_backward(iteration=iteration)
             self.callbacks.on_after_backward(model_ddp, iteration=iteration)
         grad_accum_iter += 1
         if grad_accum_iter == self.config.trainer.grad_accum_iter:

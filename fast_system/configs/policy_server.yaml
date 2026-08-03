@@ -2,14 +2,14 @@
 # Consumed by fast_system/scripts/run_pipeline.py
 
 # --- High-level behaviour ---------------------------------------------------
-instruction: "First-person indoor navigation video. Starting from the hallway with a wooden floor, and then move towards the toilet. Keep a natural walking pace, stable camera motion."
-obs_history_len: 32           # ring buffer capacity (RGB frames)
-slow_replan_interval: 8       # trigger slow replan every N fast steps (only after first z_g)
-slow_min_obs: 2               # need >= this many frames before first replan
-slow_video_frames: 8          # how many recent frames to feed the slow system
-target_fps: 5.8
-route_window: 16              # Stage-1 input window length (matches training)
-fast_sleep_time: 2          # seconds to sleep after each fast tick (lets slow catch up)
+instruction: ""                    # set dynamically via R2R episode instruction
+obs_history_len: 32                # ring buffer capacity (RGB frames)
+slow_replan_interval: 15           # ~match 17f planning horizon: use plan fully before re-request
+slow_min_obs: 5                    # need >= this many frames before first replan (matches 5 cond frames)
+slow_video_frames: 5               # how many recent frames to feed the slow system
+target_fps: 10.0                    # matches Cosmos training FPS
+route_window: 16                    # Stage-1 input window length (matches training)
+fast_sleep_time: 0.0               # no sleep needed when waypoints inference is fast
 device: cuda
 seed: 0
 log_level: INFO
@@ -19,8 +19,8 @@ fast:
   config_path: /home/wangdzh/ffnav/havana/fast_system/configs/stage2.yaml
   stage1_ckpt: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage1.pt
   stage2_ckpt: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage2.pt
-  cfm_steps: 16
-  num_trajectory_samples: 8
+  cfm_steps: 5                      # reduced from 8 for speed
+  num_trajectory_samples: 1         # reduced from 4 for speed
   use_amp: true
 
 # --- Slow (talks to slow_server.py over multiprocessing.connection) -------
@@ -28,21 +28,21 @@ slow:
   enabled: true
   remote_address: /tmp/havana-slow.sock   # match slow_server.py --serve
   remote_authkey: havana-slow             # match slow_server.py --authkey
-  connect_timeout: 60.0                   # seconds to wait for slow server up
-  num_output_frames: 77                   # only used by stub fallback
+  connect_timeout: 120.0                   # seconds to wait for slow server up (7B model load)
+  num_output_frames: 17                    # matches new 17f Cosmos output (stub fallback)
   seed: 0
 
 # --- Trajectory -> Habitat action ----------------------------------------
 adapter:
-  turn_threshold_rad: 0.1745  # ~10 deg
-  forward_threshold_m: 0.50
-  stop_threshold_m: 0.05
-  lookahead_index: 16
+  turn_threshold_rad: 0.1745        # ~10 deg
+  forward_threshold_m: 0.01          # 1cm+ forward displacement triggers move_forward
+  stop_threshold_m: 0.05             # below this & aligned -> stop
+  lookahead_index: 4                 # waypoint at ~1.5m ahead (4 x 0.38m spacing)
 
 # --- Debug visualisation -------------------------------------------------
 debug:
-  enabled: true                          # write side-by-side debug mp4
-  output_dir: /home/wangdzh/ffnav/havana/havana_debug          # main mp4 + per-replan slow videos go here
-  fps: 4.0                               # output frame rate
-  queue_size: 64                         # snapshot queue depth (overflow drops oldest)
-  save_slow_video: true                  # also dump each replan's predicted future as its own mp4
+  enabled: true                      # write side-by-side debug mp4
+  output_dir: /home/wangdzh/ffnav/havana/havana_debug
+  fps: 10.0                          # output frame rate
+  queue_size: 64                     # snapshot queue depth (overflow drops oldest)
+  save_slow_video: true              # also dump each replan's predicted future as its own mp4

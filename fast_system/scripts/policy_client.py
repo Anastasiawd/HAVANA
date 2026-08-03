@@ -104,6 +104,10 @@ class PolicyClient:
     def set_instruction(self, text: str) -> None:
         self._call("set_instruction", str(text))
 
+    def reset_episode(self, instruction: str = "") -> None:
+        """Clear server-side history/latent state and install an instruction."""
+        self._call("reset_episode", str(instruction))
+
     def get_action(self, obs: Dict[str, Any],
                    step_id: Optional[int] = None) -> Optional[str]:
         return self._call("get_action", _sanitize_obs(obs), step_id)

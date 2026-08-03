@@ -166,6 +166,7 @@ class Inference:
             else:
                 log.warning("Guardrail checks on video are disabled")
 
-            save_img_or_video(video, str(output_path), fps=16)
+            # save_img_or_video(video, str(output_path), fps=16)
+            save_img_or_video(video, str(output_path), fps=10)
             log.success(f"Saved video to {output_path}.mp4")
         return f"{output_path}.mp4"

@@ -202,23 +202,21 @@ def load_model_state_dict_from_checkpoint(
 ):
     if s3_checkpoint_dir is not None:
         s3_checkpoint_dir = str(s3_checkpoint_dir)
+    checkpoint_format = "pt" if s3_checkpoint_dir.endswith(".pt") else "dcp"
+    if s3_checkpoint_dir.startswith("s3:"):
+        if checkpoint_format == "pt":
+            cur_key_ckpt_full_path = s3_checkpoint_dir
+        elif s3_checkpoint_dir.rstrip("/").endswith("/model"):
+            cur_key_ckpt_full_path = s3_checkpoint_dir
+        else:
+            cur_key_ckpt_full_path = os.path.join(s3_checkpoint_dir, "model")
+    else:
+        cur_key_ckpt_full_path = s3_checkpoint_dir
 
     from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
-    resolved_checkpoint_path = get_checkpoint_path(s3_checkpoint_dir)
-    checkpoint_format = "pt" if resolved_checkpoint_path.endswith(".pt") else "dcp"
-
-    if resolved_checkpoint_path != s3_checkpoint_dir:
-        log.info(f"Resolved checkpoint path from {s3_checkpoint_dir} to {resolved_checkpoint_path}")
-
-    cur_key_ckpt_full_path = resolved_checkpoint_path
-    if checkpoint_format == "dcp" and not resolved_checkpoint_path.rstrip("/").endswith("/model"):
-        candidate_model_path = os.path.join(resolved_checkpoint_path, "model")
-        if candidate_model_path.startswith("s3://") or os.path.isdir(candidate_model_path):
-            cur_key_ckpt_full_path = candidate_model_path
-
-    load_from_local = checkpoint_format == "pt" and not resolved_checkpoint_path.startswith("s3://")
-    local_s3_ckpt_fp = resolved_checkpoint_path
+    load_from_local = True
+    local_s3_ckpt_fp = get_checkpoint_path(cur_key_ckpt_full_path)
 
     if SMOKE:
         return model
@@ -264,22 +262,7 @@ def load_model_state_dict_from_checkpoint(
                     for mapped_key in mapped_keys[:5]:
                         log.info(f"  {mapped_key}")
                 if missing_keys:
-                    missing_lora_keys = [
-                        key
-                        for key in missing_keys
-                        if ".lora_A." in key or ".lora_B." in key or ".lora_magnitude_vector." in key
-                    ]
-                    missing_non_lora_keys = [key for key in missing_keys if key not in missing_lora_keys]
-
-                    if missing_lora_keys:
-                        log.info(
-                            "Base checkpoint does not contain adapter weights; "
-                            f"{len(missing_lora_keys)} LoRA parameters will keep their initialized values."
-                        )
-                    if missing_non_lora_keys:
-                        log.warning(
-                            f"Missing non-LoRA keys in checkpoint: {missing_non_lora_keys[:10]}... (showing first 10)"
-                        )
+                    log.warning(f"Missing keys in checkpoint: {missing_keys[:10]}... (showing first 10)")
 
                 local_state_dict = mapped_state_dict
 
@@ -287,7 +270,7 @@ def load_model_state_dict_from_checkpoint(
             load_info = model.load_state_dict(local_state_dict, strict=False)
             log.info(f"Checkpoint weights loaded from {local_s3_ckpt_fp}: {load_info}")
             if load_info is None:
-                log.info("Checkpoint weights loaded successfully via the model's custom non-strict load path.")
+                log.info("Checkpoint weights loaded successfully (strict=True).")
             elif not load_info.missing_keys and not load_info.unexpected_keys:
                 log.info("Checkpoint weights loaded successfully (all keys matched).")
             else:
@@ -306,6 +289,11 @@ def load_model_state_dict_from_checkpoint(
             log.info(
                 f"Skipping sync for {len(params_and_buffers_to_ignore)} EMA parameters and buffers to avoid OOM during initialization"
             )
+
+        if hasattr(model, "params_and_buffers_to_ignore_for_sync"):
+            extra_ignored = model.params_and_buffers_to_ignore_for_sync()
+            params_and_buffers_to_ignore.update(extra_ignored)
+            log.info(f"Skipping sync for {len(extra_ignored)} model-specific parameters and buffers")
 
         distributed.sync_model_states(model, src=0, params_and_buffers_to_ignore=params_and_buffers_to_ignore)
     else:
@@ -368,7 +356,11 @@ def load_model_state_dict_from_checkpoint(
                 _model_wrapper.load_state_dict(_state_dict)
 
             # Synchronize model states from rank 0 to all other ranks
-            distributed.sync_model_states(model, src=0)
+            params_and_buffers_to_ignore = set()
+            if hasattr(model, "params_and_buffers_to_ignore_for_sync"):
+                params_and_buffers_to_ignore.update(model.params_and_buffers_to_ignore_for_sync())
+                log.info(f"Skipping sync for {len(params_and_buffers_to_ignore)} model-specific parameters and buffers")
+            distributed.sync_model_states(model, src=0, params_and_buffers_to_ignore=params_and_buffers_to_ignore)
 
         # Cache the model state dict only on rank0 to be consistent with loading
         if local_cache_dir is not None and distributed.is_rank0():

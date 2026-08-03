@@ -1261,6 +1261,7 @@ class Block(nn.Module):
         crossattn_emb: torch.Tensor,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        waypoint_crossattn_mod_B_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
     ) -> torch.Tensor:
@@ -1286,6 +1287,15 @@ class Block(nn.Module):
                     self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
                 )
                 shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+
+            if waypoint_crossattn_mod_B_3D is not None:
+                waypoint_crossattn_mod_B_3D = waypoint_crossattn_mod_B_3D.to(
+                    device=shift_cross_attn_B_T_D.device, dtype=shift_cross_attn_B_T_D.dtype
+                )
+                wp_shift_B_D, wp_scale_B_D, wp_gate_B_D = waypoint_crossattn_mod_B_3D.chunk(3, dim=-1)
+                shift_cross_attn_B_T_D = shift_cross_attn_B_T_D + wp_shift_B_D.unsqueeze(1)
+                scale_cross_attn_B_T_D = scale_cross_attn_B_T_D + wp_scale_B_D.unsqueeze(1)
+                gate_cross_attn_B_T_D = gate_cross_attn_B_T_D + wp_gate_B_D.unsqueeze(1)
 
         # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
@@ -1523,6 +1533,7 @@ class MiniTrainDIT(WeightTrainingStat):
             TimestepEmbedding(model_channels, model_channels, use_adaln_lora=use_adaln_lora),
         )
         self.use_crossattn_projection = use_crossattn_projection
+        self.crossattn_emb_channels = crossattn_emb_channels
         self.crossattn_proj_in_channels = crossattn_proj_in_channels
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
 
@@ -1719,6 +1730,8 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        crossattn_emb_preprojected: bool = False,
+        waypoints_norm: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -1729,14 +1742,27 @@ class MiniTrainDIT(WeightTrainingStat):
         assert isinstance(data_type, DataType), (
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
         )
+        del waypoints_norm
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
             padding_mask=padding_mask,
         )
 
-        if self.use_crossattn_projection:
-            crossattn_emb = self.crossattn_proj(crossattn_emb)
+        if self.use_crossattn_projection and not crossattn_emb_preprojected:
+            if crossattn_emb.shape[-1] == self.crossattn_proj_in_channels:
+                crossattn_emb = self.crossattn_proj(crossattn_emb)
+            elif crossattn_emb.shape[-1] != self.crossattn_emb_channels:
+                raise ValueError(
+                    f"crossattn_emb dim {crossattn_emb.shape[-1]} does not match either "
+                    f"crossattn_proj_in_channels={self.crossattn_proj_in_channels} or "
+                    f"crossattn_emb_channels={self.crossattn_emb_channels}"
+                )
+        elif crossattn_emb_preprojected:
+            assert crossattn_emb.shape[-1] == self.crossattn_emb_channels, (
+                f"preprojected crossattn_emb dim {crossattn_emb.shape[-1]} "
+                f"!= expected {self.crossattn_emb_channels}"
+            )
 
         if img_context_emb is not None:
             assert self.extra_image_context_dim is not None, (

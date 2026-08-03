@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -68,8 +66,13 @@ class Processor:
         else:
             self.is_vision_tokenizer = True
 
-        self.processor = AutoProcessor.from_pretrained(self._resolve_processor_source(name, cache_dir))
-        log.info("Successfully loaded processor")
+        s3_uri = f"s3://bucket/cosmos_reasoning1/pretrained/Qwen_tokenizer/{name}/"
+        from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
+
+        cache_dir = get_checkpoint_path(s3_uri)
+
+        self.processor = AutoProcessor.from_pretrained(cache_dir)
+        log.info("Successfully loaded processor from local cache")
 
         if hasattr(self.processor, "image_token"):
             self.image_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
@@ -86,49 +89,6 @@ class Processor:
         else:
             self.eos_id = self.processor.eos_token_id
             self.pad_id = self.processor.pad_token_id
-
-    @staticmethod
-    def _get_hf_hub_dir() -> Path:
-        hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
-        return Path(hf_home).expanduser() / "hub"
-
-    @classmethod
-    def _find_local_hf_snapshot(cls, repo_id: str) -> Optional[str]:
-        repo_cache = cls._get_hf_hub_dir() / f"models--{repo_id.replace('/', '--')}" / "snapshots"
-        if not repo_cache.exists():
-            return None
-        snapshots = sorted(p for p in repo_cache.iterdir() if p.is_dir())
-        if not snapshots:
-            return None
-        return str(snapshots[-1])
-
-    @classmethod
-    def _resolve_processor_source(cls, name: str, cache_dir: Optional[str]) -> str:
-        if cache_dir:
-            return cache_dir
-
-        # Prefer the internal checkpoint cache when available.
-        s3_uri = f"s3://bucket/cosmos_reasoning1/pretrained/Qwen_tokenizer/{name}/"
-        try:
-            from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
-
-            resolved = get_checkpoint_path(s3_uri)
-            if resolved and Path(resolved).exists():
-                log.info(f"Loading processor from internal cache: {resolved}")
-                return resolved
-        except Exception as e:
-            log.warning(f"Falling back from internal tokenizer cache for {name}: {e}")
-
-        # Next, try a matching Hugging Face snapshot already present locally.
-        for repo_id in [name, "nvidia/Cosmos-Reason1-7B"]:
-            snapshot = cls._find_local_hf_snapshot(repo_id)
-            if snapshot is not None:
-                log.info(f"Loading processor from local Hugging Face snapshot: {snapshot}")
-                return snapshot
-
-        # Final fallback: let transformers resolve the repo id.
-        log.warning(f"Processor cache not found locally for {name}; falling back to AutoProcessor repo resolution.")
-        return name
 
     def apply_chat_template(
         self, messages, add_generation_prompt=False, return_tensors="pt", tokenize=True, add_vision_id=False

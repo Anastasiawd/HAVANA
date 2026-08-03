@@ -1,17 +1,18 @@
 # Slow world-model RPC server config
 # Consumed by slow_system/scripts/slow_server.py
 
-checkpoint_path: /home/wangdzh/Downloads/H20_weights/iter_000001000_exported
-checkpoint_filename: model_ema_bf16.pt
-experiment: predict2_lora_training_2b_vln_json
+checkpoint_path: /home/wangdzh/Downloads/lang_wpc_iter_40000
+checkpoint_filename: model.pt
+experiment: predict2_video2world_training_2b_vln_temporal_waypoint_17f_full_finetune
 config_file: ""              # cosmos default for the experiment
 resolution: "272,480"        # H,W
 # Maps to cosmos's `num_latent_conditional_frames` (1 or 2). Training pinned
 # max/min_num_conditional_frames=2, so keep 2 to stay in distribution.
 num_conditional_frames: 2
-num_steps: 8
+num_steps: 8                 # reduced; waypoints don't depend on denoising
 guidance: 7
 offload_diffusion_model: true
 offload_text_encoder: true
 offload_tokenizer: true
 disable_guardrails: true
+aggressive_unload: true      # move submodules back to CPU between calls (saves VRAM)

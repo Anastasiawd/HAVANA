@@ -71,6 +71,8 @@ class WandbCallback(Callback):
         self.train_image_log = _LossRecord()
         self.train_video_log = _LossRecord()
         self.final_loss_log = _LossRecord()
+        self.extra_metric_sums: dict[str, torch.Tensor] = {}
+        self.extra_metric_counts: dict[str, int] = {}
 
         self.img_unstable_count = torch.zeros(1, device="cuda")
         self.video_unstable_count = torch.zeros(1, device="cuda")
@@ -81,6 +83,31 @@ class WandbCallback(Callback):
         self.save_s3 = save_s3
         self.wandb_extra_tag = f"@{logging_iter_multipler}" if logging_iter_multipler > 1 else ""
         self.name = "wandb_loss_log" + self.wandb_extra_tag
+
+    def _record_extra_metrics(self, output_batch: dict[str, torch.Tensor]) -> None:
+        for key, value in output_batch.items():
+            if not (key.startswith("waypoint") or key.startswith("wp") or key == "denoise_loss"):
+                continue
+            if not isinstance(value, torch.Tensor) or value.numel() != 1:
+                continue
+            if key not in self.extra_metric_sums:
+                self.extra_metric_sums[key] = torch.zeros((), device=value.device, dtype=torch.float32)
+                self.extra_metric_counts[key] = 0
+            self.extra_metric_sums[key] += value.detach().float().reshape(())
+            self.extra_metric_counts[key] += 1
+
+    def _flush_extra_metrics(self) -> dict[str, float]:
+        metrics = {}
+        for key, value_sum in self.extra_metric_sums.items():
+            count = self.extra_metric_counts[key]
+            if count <= 0:
+                continue
+            value = value_sum / count
+            dist.all_reduce(value, op=dist.ReduceOp.AVG)
+            metrics[f"train{self.wandb_extra_tag}/{key}"] = value.item()
+        self.extra_metric_sums = {}
+        self.extra_metric_counts = {}
+        return metrics
 
     @distributed.rank0_only
     def on_train_start(self, model: ImaginaireModel, iteration: int = 0) -> None:
@@ -146,6 +173,7 @@ class WandbCallback(Callback):
             self.final_loss_log.loss += loss.detach().float()
             self.final_loss_log.iter_count += 1
             self.final_loss_log.edm_loss += output_batch["edm_loss"].detach().float()
+            self._record_extra_metrics(output_batch)
         else:
             if model.is_image_batch(data_batch):
                 self.img_unstable_count += 1
@@ -160,6 +188,7 @@ class WandbCallback(Callback):
             avg_image_loss, avg_image_edm_loss = self.train_image_log.get_stat()
             avg_video_loss, avg_video_edm_loss = self.train_video_log.get_stat()
             avg_final_loss, avg_final_edm_loss = self.final_loss_log.get_stat()
+            extra_metrics = self._flush_extra_metrics()
 
             dist.all_reduce(self.img_unstable_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(self.video_unstable_count, op=dist.ReduceOp.SUM)
@@ -180,6 +209,7 @@ class WandbCallback(Callback):
                         "sample_counter": getattr(self.trainer, "sample_counter", iteration),
                     }
                 )
+                info.update(extra_metrics)
                 if self.save_s3:
                     if (
                         iteration

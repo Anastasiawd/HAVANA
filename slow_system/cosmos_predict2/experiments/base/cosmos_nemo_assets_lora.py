@@ -70,12 +70,11 @@ example_dataset_cosmos_nemo_assets_lora_json_val = L(VideoDataset)(
     video_size=(704, 1280),
     caption_format="json",
     prompt_type="long",
-    random_clip=False,
 )
 
 dataloader_val_cosmos_nemo_assets_lora_json = L(get_generic_dataloader)(
     dataset=example_dataset_cosmos_nemo_assets_lora_json_val,
-    sampler=L(get_sampler)(dataset=example_dataset_cosmos_nemo_assets_lora_json_val, shuffle=False),
+    sampler=L(get_sampler)(dataset=example_dataset_cosmos_nemo_assets_lora_json_val),
     batch_size=1,
     drop_last=True,
     num_workers=4,
@@ -88,9 +87,6 @@ _lora_defaults = [
     f"/experiment/{DEFAULT_CHECKPOINT.experiment}",
     {"override /data_train": "mock"},
     {"override /data_val": "mock"},
-    # LoRA training needs the DCP checkpointer to materialize the pretrained DiT
-    # from `checkpoint.load_path` before adapter tuning begins.
-    {"override /ckpt_type": "dcp"},
     "_self_",
 ]
 

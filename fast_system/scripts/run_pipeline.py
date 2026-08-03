@@ -282,6 +282,10 @@ class ObservationRingBuffer:
         with self._lock:
             return self._buf[-1] if self._buf else None
 
+    def clear(self) -> None:
+        with self._lock:
+            self._buf.clear()
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._buf)
@@ -341,6 +345,11 @@ class SharedLatentState:
     def get(self) -> Optional[LatentInfo]:
         with self._lock:
             return self._info
+
+    def clear(self) -> None:
+        """Drop the current latent while keeping version ids monotonic."""
+        with self._lock:
+            self._info = None
 
 
 # =========================================================================== #
@@ -642,6 +651,27 @@ class SlowReplanWorker(threading.Thread):
             self._pending = (step_id, frames)
             self._has_request.set()
 
+    def discard_pending_and_wait(self, timeout: float) -> None:
+        """Drain work from the previous episode before policy state is reset."""
+        with self._lock:
+            self._pending = None
+            self._has_request.clear()
+
+        deadline = time.time() + max(0.0, float(timeout))
+        while self._is_busy.is_set():
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    "timed out waiting for the slow replan worker to finish "
+                    "the previous episode"
+                )
+            time.sleep(0.05)
+
+        # No get_action call runs concurrently with benchmark reset, but clear
+        # once more in case a request was queued immediately before reset.
+        with self._lock:
+            self._pending = None
+            self._has_request.clear()
+
     def stop(self) -> None:
         self._stop_event.set()
         self._has_request.set()
@@ -656,10 +686,13 @@ class SlowReplanWorker(threading.Thread):
                 req = self._pending
                 self._pending = None
                 self._has_request.clear()
+                if req is not None:
+                    # Set this while holding _lock so reset cannot observe the
+                    # request as neither pending nor busy.
+                    self._is_busy.set()
             if req is None:
                 continue
             try:
-                self._is_busy.set()
                 self._process(*req)
             except Exception as exc:  # noqa: BLE001
                 LOG.error("[SlowWorker] replan failed: %s\n%s", exc, traceback.format_exc())
@@ -1198,6 +1231,19 @@ class HavanaPolicyServer:
         LOG.info("[Server] instruction updated: '%s'", text)
         self._instruction.set(text)
 
+    def reset_episode(self, instruction: str = "") -> None:
+        """Clear recurrent policy state before starting a new eval episode."""
+        if self._started:
+            timeout = max(30.0, float(self.cfg.slow.connect_timeout) * 2.0)
+            self._slow_worker.discard_pending_and_wait(timeout=timeout)
+        self._obs_buf.clear()
+        self._shared_zg.clear()
+        self._instruction.set(str(instruction))
+        self._step_count = 0
+        self._first_zg_seen = False
+        self._last_visualised_version = 0
+        LOG.info("[Server] episode reset; instruction='%s'", instruction)
+
     def start(self) -> None:
         if self._started:
             return
@@ -1409,7 +1455,13 @@ class PolicyRpcServer:
     `{"ok": bool, "result": ...}` or `{"ok": False, "error": "..."}`.
     """
 
-    _OPS = {"ping", "attach_action_space", "set_instruction", "get_action"}
+    _OPS = {
+        "ping",
+        "attach_action_space",
+        "set_instruction",
+        "reset_episode",
+        "get_action",
+    }
 
     def __init__(self, server: "HavanaPolicyServer", address: str,
                  authkey: bytes = b"havana"):
@@ -1484,6 +1536,9 @@ class PolicyRpcServer:
             return None
         if op == "set_instruction":
             self.server.set_instruction(args[0])
+            return None
+        if op == "reset_episode":
+            self.server.reset_episode(args[0] if args else "")
             return None
         if op == "get_action":
             obs, step_id = args[0], args[1]

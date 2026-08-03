@@ -222,7 +222,7 @@ class QwenVLBaseModel(QwenModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        if self.cp_mesh is not None:
+        if hasattr(self, "cp_mesh") and self.cp_mesh is not None:
             logits = DTensor.from_local(logits, device_mesh=self.cp_mesh, placements=[Shard(1)]).full_tensor()  # noqa: F821
         return logits, outputs
 

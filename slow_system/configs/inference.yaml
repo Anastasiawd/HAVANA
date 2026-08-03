@@ -1,0 +1,31 @@
+# Slow system direct inference config
+# Consumed by slow_system/scripts/inference.py
+
+checkpoint_path: /home/wangdzh/Downloads/augmented_iter_26000
+checkpoint_filename: model_ema_bf16.pt
+experiment: predict2_video2world_training_2b_vln_online_reason2_align_29f_10fps_272_480
+config_file: ""
+# Local Cosmos-Reason1 text encoder (dir/HF snapshot). Empty = auto-discover
+# nvidia/Cosmos-Reason1-7B from the HuggingFace cache.
+reason1_ckpt_path: ""
+
+# Input/output settings
+input_images: ["/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg", "/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg", "/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg","/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg","/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg"]
+output_dir: ./outputs
+save_video: true
+save_frames: false
+
+# Inference parameters
+resolution: "272,480"        # H,W
+num_conditional_frames: 2    # 1 or 2 (number of input images to condition on)
+num_output_frames: 29        # number of frames to generate ((state_t-1)*4+1, state_t=8)
+num_steps: 35
+guidance: 7
+seed: 0
+
+# Memory optimization
+offload_diffusion_model: true
+offload_text_encoder: true
+offload_tokenizer: true
+disable_guardrails: true
+aggressive_unload: false

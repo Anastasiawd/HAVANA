@@ -1,3 +1,6 @@
 [submodule "fast_system/model/lingbot-depth"]
 	path = fast_system/model/lingbot-depth
 	url = https://github.com/Robbyant/lingbot-depth
+[submodule "cosmos-predict2.5"]
+	path = cosmos-predict2.5
+	url = https://github.com/Anastasiawd/cosmos-predict2.5.git

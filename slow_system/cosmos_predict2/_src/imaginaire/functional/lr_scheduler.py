@@ -132,18 +132,10 @@ class LambdaWarmUpCosineScheduler:
             if n <= cl:
                 return interval
             interval += 1
-        # Clamp to the final cycle once training steps exceed the configured
-        # schedule horizon so resumed runs can safely continue at the final LR.
-        return len(self.cycle_lengths) - 1
-
-    def get_cycle_and_offset(self, n):
-        cycle = self.find_in_interval(n)
-        n = n - self.cum_cycles[cycle]
-        n = min(max(n, 0), self.cycle_lengths[cycle])
-        return cycle, n
 
     def schedule(self, n, **kwargs):
-        cycle, n = self.get_cycle_and_offset(n)
+        cycle = self.find_in_interval(n)
+        n = n - self.cum_cycles[cycle]
         if self.verbosity_interval > 0:
             if n % self.verbosity_interval == 0:
                 log.info(f"current step: {n}, recent lr-multiplier: {self.last_f}, current cycle {cycle}")
@@ -168,7 +160,8 @@ class LambdaLinearScheduler(LambdaWarmUpCosineScheduler):
     """
 
     def schedule(self, n, **kwargs):
-        cycle, n = self.get_cycle_and_offset(n)
+        cycle = self.find_in_interval(n)
+        n = n - self.cum_cycles[cycle]
         if self.verbosity_interval > 0:
             if n % self.verbosity_interval == 0:
                 log.info(f"current step: {n}, recent lr-multiplier: {self.last_f}, current cycle {cycle}")

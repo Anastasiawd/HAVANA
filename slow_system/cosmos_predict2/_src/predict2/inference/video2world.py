@@ -313,34 +313,23 @@ class Video2WorldInference:
         if self.offload_diffusion_model:
             os.environ["COSMOS_PREDICT2_OFFLOAD_DIT"] = "1"
 
-        previous_text_encoder_init_device = os.environ.get("COSMOS_PREDICT2_TEXT_ENCODER_INIT_DEVICE")
-        if self.offload_text_encoder:
-            os.environ["COSMOS_PREDICT2_TEXT_ENCODER_INIT_DEVICE"] = "cpu"
-
-        try:
-            if config_file and "interactive" in config_file:
-                model, config = load_distilled_model_from_checkpoint(
-                    experiment_name=self.experiment_name,
-                    s3_checkpoint_dir=self.ckpt_path,
-                    config_file=config_file,
-                    load_ema_to_reg=True,
-                    experiment_opts=experiment_opts,
-                )
-            else:
-                model, config = load_model_from_checkpoint(
-                    experiment_name=self.experiment_name,
-                    s3_checkpoint_dir=self.ckpt_path,
-                    config_file=config_file,
-                    load_ema_to_reg=True,
-                    experiment_opts=experiment_opts,
-                    to_device=model_device,
-                )
-        finally:
-            if self.offload_text_encoder:
-                if previous_text_encoder_init_device is None:
-                    os.environ.pop("COSMOS_PREDICT2_TEXT_ENCODER_INIT_DEVICE", None)
-                else:
-                    os.environ["COSMOS_PREDICT2_TEXT_ENCODER_INIT_DEVICE"] = previous_text_encoder_init_device
+        if config_file and "interactive" in config_file:
+            model, config = load_distilled_model_from_checkpoint(
+                experiment_name=self.experiment_name,
+                s3_checkpoint_dir=self.ckpt_path,
+                config_file=config_file,
+                load_ema_to_reg=True,
+                experiment_opts=experiment_opts,
+            )
+        else:
+            model, config = load_model_from_checkpoint(
+                experiment_name=self.experiment_name,
+                s3_checkpoint_dir=self.ckpt_path,
+                config_file=config_file,
+                load_ema_to_reg=True,
+                experiment_opts=experiment_opts,
+                to_device=model_device,
+            )
 
         # By default, everything will be constructed directly on the GPU (except DiT)
         # Handle offloading options at inference entry
@@ -438,7 +427,8 @@ class Video2WorldInference:
             "dataset_name": "video_data",
             "video": video,
             "action": action.unsqueeze(0) if action is not None else None,
-            "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
+            # "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
+            "fps": torch.full((self.batch_size,), 10.0),
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }
@@ -457,8 +447,11 @@ class Video2WorldInference:
         if use_neg_prompt:
             assert negative_prompt is not None, "Negative prompt is required when use_neg_prompt is True"
 
-        # Compute text embeddings
-        if self.model.text_encoder is not None:
+        # VLN waypoint models compute Reason1 context and waypoint tokens
+        # together inside their sampling path; a separate T5 embedding is incorrect.
+        if hasattr(self.model, "trajectory_reason_encoder"):
+            data_batch["ai_caption"] = [prompt]
+        elif self.model.text_encoder is not None:
             data_batch["ai_caption"] = [prompt]
             data_batch["t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
                 data_batch={"ai_caption": [prompt], "images": None},
@@ -487,7 +480,7 @@ class Video2WorldInference:
         input_path: str | torch.Tensor | None,
         guidance: int = 7,
         num_video_frames: int = 77,
-        num_latent_conditional_frames: int = 1,
+        num_latent_conditional_frames: int = 2,
         num_input_video: int = 1,
         num_output_video: int = 1,
         resolution: str = "192,320",
@@ -583,6 +576,23 @@ class Video2WorldInference:
             use_neg_prompt=True,
         )
 
+        # Temporal-waypoint models use a separate Reason1 encoder rather than
+        # ``model.text_encoder``.  Compute its compact context/waypoint outputs
+        # while DiT is still on CPU, then offload Reason1 before loading DiT.
+        # The model consumes the cached outputs once in get_velocity_fn_from_batch.
+        prepare_reason = getattr(self.model, "prepare_reason_conditioning_for_inference", None)
+        offload_reason = getattr(self.model, "offload_reason_conditioner_for_inference", None)
+        staged_reason_offload = (
+            self.offload_text_encoder and callable(prepare_reason) and callable(offload_reason)
+        )
+        if staged_reason_offload:
+            log.info("[Memory Optimization] Loading temporal Reason1 conditioner to GPU")
+            try:
+                prepare_reason(data_batch)
+            finally:
+                log.info("[Memory Optimization] Offloading temporal Reason1 conditioner to CPU")
+                offload_reason()
+
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         log.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
 
@@ -627,15 +637,23 @@ class Video2WorldInference:
             generate_samples = self.model.generate_samples_from_batch_lora
         else:
             generate_samples = self.model.generate_samples_from_batch
-        sample = generate_samples(
-            data_batch,
-            n_sample=1,  # Generate one sample
-            guidance=guidance,
-            seed=seed,  # Fixed seed for reproducibility
-            is_negative_prompt=True,  # Use classifier-free guidance
-            num_steps=num_steps,
-            **extra_kwargs,
-        )
+        try:
+            sample = generate_samples(
+                data_batch,
+                n_sample=1,  # Generate one sample
+                guidance=guidance,
+                seed=seed,  # Fixed seed for reproducibility
+                is_negative_prompt=True,  # Use classifier-free guidance
+                num_steps=num_steps,
+                **extra_kwargs,
+            )
+        finally:
+            if staged_reason_offload:
+                clear_reason_cache = getattr(
+                    self.model, "clear_reason_conditioning_cache_for_inference", None
+                )
+                if callable(clear_reason_cache):
+                    clear_reason_cache()
 
         # Memory Optimization Step 4: Offload Diffusion Network
         # Offload diffusion network after sampling to make room for decoder

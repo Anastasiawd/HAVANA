@@ -39,10 +39,10 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        crossattn_emb_preprojected: bool = False,
+        waypoints_norm: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
-        del kwargs
-
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
         else:
@@ -59,4 +59,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             data_type=data_type,
             intermediate_feature_ids=intermediate_feature_ids,
             img_context_emb=img_context_emb,
+            crossattn_emb_preprojected=crossattn_emb_preprojected,
+            waypoints_norm=waypoints_norm,
+            **kwargs,
         )

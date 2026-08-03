@@ -70,14 +70,11 @@ class TextEncoder:
     def __init__(self, config: TextEncoderConfig, device: str = "cuda"):
         self.config = config
         self.device = device
-        init_device = os.environ.get("COSMOS_PREDICT2_TEXT_ENCODER_INIT_DEVICE", self.device)
 
         log.info("Instantiating text encoder model...")
         with torch.device("meta"):
             self.model = lazy_instantiate(self.config.model_config)
-        if init_device != self.device:
-            log.info(f"Materializing text encoder on {init_device} for deferred runtime move to {self.device}.")
-        self.model.to_empty(device=init_device)
+        self.model.to_empty(device=self.device)
         if SMOKE:
             return
         with torch.no_grad():
@@ -180,7 +177,7 @@ class TextEncoder:
             else:
                 # Do truncation:
                 input_ids = input_ids.tolist()[:NUM_EMBEDDING_PADDING_TOKENS]
-            input_ids = torch.LongTensor(input_ids).to(device=self.device)
+            input_ids = torch.LongTensor(input_ids).to(device="cuda")
             input_ids_batch.append(input_ids)
 
         input_ids_batch = torch.stack(input_ids_batch, dim=0)

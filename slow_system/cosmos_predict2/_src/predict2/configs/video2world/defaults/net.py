@@ -21,7 +21,11 @@ from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
 from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import SACConfig
+from cosmos_predict2._src.predict2.networks.temporal_waypoint_minimal_v1_lvg_dit import (
+    TemporalWaypointMinimalV1LVGDiT,
+)
 from cosmos_predict2._src.predict2.networks.wan2pt1 import WanModel
+from cosmos_predict2._src.predict2.networks.waypoint_minimal_v1_lvg_dit import WaypointMinimalV1LVGDiT
 
 WAN2PT1_1PT3B: LazyDict = L(WanModel)(
     dim=1536,
@@ -86,6 +90,17 @@ COSMOS_V1_2B_NET_MININET.num_blocks = 28
 COSMOS_V1_2B_NET_MININET.extra_per_block_abs_pos_emb = False
 COSMOS_V1_2B_NET_MININET.rope_t_extrapolation_ratio = 1.0
 
+COSMOS_V1_2B_WAYPOINT_NET_MININET = copy.deepcopy(COSMOS_V1_2B_NET_MININET)
+COSMOS_V1_2B_WAYPOINT_NET_MININET._target_ = WaypointMinimalV1LVGDiT
+COSMOS_V1_2B_WAYPOINT_NET_MININET.num_waypoints = 4
+COSMOS_V1_2B_WAYPOINT_NET_MININET.waypoint_dim = 3
+
+COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET = copy.deepcopy(COSMOS_V1_2B_NET_MININET)
+COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET._target_ = TemporalWaypointMinimalV1LVGDiT
+COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET.num_waypoints = 3
+COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET.waypoint_dim = 3
+COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET.num_condition_latents = 2
+
 COSMOS_V1_14B_NET_MININET = copy.deepcopy(COSMOS_V1_7B_NET_MININET)
 COSMOS_V1_14B_NET_MININET.model_channels = 5120
 COSMOS_V1_14B_NET_MININET.num_heads = 40
@@ -106,5 +121,14 @@ def register_net():
     cs.store(group="net", package="model.config.net", name="wan2pt1_14B", node=WAN2PT1_14B)
     cs.store(group="net", package="model.config.net", name="mini_net", node=mini_net)
     cs.store(group="net", package="model.config.net", name="cosmos_v1_2B", node=COSMOS_V1_2B_NET_MININET)
+    cs.store(
+        group="net", package="model.config.net", name="cosmos_v1_2B_waypoint", node=COSMOS_V1_2B_WAYPOINT_NET_MININET
+    )
+    cs.store(
+        group="net",
+        package="model.config.net",
+        name="cosmos_v1_2B_temporal_waypoint",
+        node=COSMOS_V1_2B_TEMPORAL_WAYPOINT_NET_MININET,
+    )
     cs.store(group="net", package="model.config.net", name="cosmos_v1_7B", node=COSMOS_V1_7B_NET_MININET)
     cs.store(group="net", package="model.config.net", name="cosmos_v1_14B", node=COSMOS_V1_14B_NET_MININET)

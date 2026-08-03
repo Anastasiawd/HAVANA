@@ -121,6 +121,15 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         self.sigma_min = self.sigmas[-1].item()
         self.sigma_max = self.sigmas[0].item()
 
+    @staticmethod
+    def _solve_coefficient_system(
+        R: torch.Tensor, b: torch.Tensor, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # UniPC solves tiny schedule-only systems; keeping them on CPU avoids cuSOLVER handle failures in DDP sampling.
+        R_cpu = R.detach().to(device="cpu", dtype=torch.float64)
+        b_cpu = b.detach().to(device="cpu", dtype=torch.float64)
+        return torch.linalg.solve(R_cpu, b_cpu).to(device=device, dtype=dtype)
+
     @property
     def step_index(self):
         """
@@ -441,7 +450,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             if order == 2:
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                rhos_p = self._solve_coefficient_system(R[:-1, :-1], b[:-1], device=device, dtype=x.dtype)
         else:
             D1s = None
 
@@ -579,7 +588,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            rhos_c = self._solve_coefficient_system(R, b, device=device, dtype=x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0

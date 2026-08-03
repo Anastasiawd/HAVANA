@@ -1,0 +1,64 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Python environments and packaging artifacts
+/.venv/
+/venv/
+/env/
+**/.venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs, temporary files, and experiment tracking
+*.log
+*.tmp
+*.temp
+wandb/
+mlruns/
+lightning_logs/
+
+# Generated outputs and debug artifacts
+outputs/
+output/
+results/
+havana_debug/
+slow_system/cosmos_predict2_bkp/
+
+# Large datasets, model weights, and checkpoints
+/datasets/
+checkpoints/
+model_weights/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine

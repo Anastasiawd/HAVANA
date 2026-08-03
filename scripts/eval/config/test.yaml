@@ -1,0 +1,36 @@
+# Havana eval_fast.py test-mode config.
+# Layered with vln_r2r.yaml (which contributes simulator + sensors + actions);
+# this file holds the scene + episode + keyboard bits that are unique to
+# interactive / debug runs.
+
+# Path to the InternNav vln_r2r.yaml (relative paths are resolved against
+# this file's directory).
+vln_r2r_config: /home/wangdzh/ffnav/InternNav/scripts/eval/configs/vln_r2r.yaml
+
+# Folder that contains <scene_id>/<scene_id>.glb subdirectories
+# (Matterport3D layout).
+scenes_dir: /home/wangdzh/data/mp3d
+
+# Default scene used when --scene-id is not passed on the CLI.
+default_scene_id: 1LXtFkjw3qL
+
+# Optional R2R-style episodes JSON. When set together with --episode-id,
+# eval_fast.py looks up start_position / start_rotation by episode_id.
+# Leave empty to fall back to start_position below or pathfinder random pose.
+episodes_path: ""
+
+# Optional fixed start pose. Used only if episodes_path lookup fails / is
+# unset. World-frame [x, y, z] in meters; rotation is [x, y, z, w] (vln_ce
+# convention; eval_fast.py converts to numpy quaternion).
+start_position: null
+start_rotation: null
+
+# Keyboard -> action-name map for --keyboard mode. Keys are lowercase ASCII;
+# values must be in the action_names list resolved from vln_r2r.yaml.
+keyboard:
+  w: move_forward
+  a: turn_left
+  d: turn_right
+  q: look_up
+  e: look_down
+  s: stop
