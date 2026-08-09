@@ -4,21 +4,19 @@
 # --- High-level behaviour ---------------------------------------------------
 instruction: ""                    # set dynamically via R2R episode instruction
 obs_history_len: 32                # ring buffer capacity (RGB frames)
-slow_replan_interval: 15           # ~match 17f planning horizon: use plan fully before re-request
+slow_replan_interval: 12
 slow_min_obs: 5                    # need >= this many frames before first replan (matches 5 cond frames)
-slow_video_frames: 5               # how many recent frames to feed the slow system
+slow_input_frames: 5               # fixed Reason1 RGB condition frames
 target_fps: 10.0                    # matches Cosmos training FPS
-route_window: 16                    # Stage-1 input window length (matches training)
 fast_sleep_time: 0.0               # no sleep needed when waypoints inference is fast
 device: cuda
 seed: 0
 log_level: INFO
 
-# --- Fast (Stage-1 + Stage-2) ---------------------------------------------
+# --- Fast (PlanEncoder + RGB Stage-2) -------------------------------------
 fast:
-  config_path: /home/wangdzh/ffnav/havana/fast_system/configs/stage2.yaml
-  stage1_ckpt: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage1.pt
-  stage2_ckpt: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage2.pt
+  config_path: /home/csevolunt/dongzhih/HAVANA/fast_system/configs/plan_stage2.yaml
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2/last.pt
   cfm_steps: 5                      # reduced from 8 for speed
   num_trajectory_samples: 1         # reduced from 4 for speed
   use_amp: true
@@ -29,7 +27,6 @@ slow:
   remote_address: /tmp/havana-slow.sock   # match slow_server.py --serve
   remote_authkey: havana-slow             # match slow_server.py --authkey
   connect_timeout: 120.0                   # seconds to wait for slow server up (7B model load)
-  num_output_frames: 17                    # matches new 17f Cosmos output (stub fallback)
   seed: 0
 
 # --- Trajectory -> Habitat action ----------------------------------------
@@ -37,12 +34,12 @@ adapter:
   turn_threshold_rad: 0.1745        # ~10 deg
   forward_threshold_m: 0.01          # 1cm+ forward displacement triggers move_forward
   stop_threshold_m: 0.05             # below this & aligned -> stop
-  lookahead_index: 4                 # waypoint at ~1.5m ahead (4 x 0.38m spacing)
+  lookahead_index: 4
 
 # --- Debug visualisation -------------------------------------------------
 debug:
   enabled: true                      # write side-by-side debug mp4
-  output_dir: /home/wangdzh/ffnav/havana/havana_debug
+  output_dir: /home/csevolunt/dongzhih/HAVANA/havana_debug
   fps: 10.0                          # output frame rate
   queue_size: 64                     # snapshot queue depth (overflow drops oldest)
-  save_slow_video: true              # also dump each replan's predicted future as its own mp4
+  save_slow_video: false

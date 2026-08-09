@@ -1,0 +1,128 @@
+seed: 5
+device: cuda
+
+wandb:
+  enabled: true
+  mode: online
+  project: havana-fast-nav
+  entity: null
+  name: havana-plan-stage2-online-bs4
+  group: reason1-plan-conditioning
+  tags: [online-reason1, frozen-reason1, batch-4]
+  log_every: 1
+
+online_reason1:
+  checkpoint: /home/csevolunt/dongzhih/cosmos-predict2.5/runs/cosmos_predict_v2p5/video2world_vln/2b_vln_temporal_wp_17f_full_finetune/checkpoints/iter_000060000/model.pt
+  experiment: predict2_video2world_training_2b_vln_temporal_waypoint_17f_full_finetune
+  config_file: ""
+  log_interval: 10
+
+plan_encoder:
+  context_dim: 1024
+  trajectory_dim: 3584
+  hidden_dim: 384
+  num_route_queries: 16
+  num_trajectory_tokens: 3
+  trajectory_anchor_steps: [4, 8, 12]
+  time_normalizer: 12.0
+  num_layers: 3
+  num_heads: 6
+  mlp_ratio: 4.0
+  dropout: 0.1
+
+model:
+  encoding_size: 256
+  context_size: 3
+  plan_dim: 384
+  action_dim: 3
+  action_horizon: 16
+  action_stats:
+    min: [-0.15, -0.025, -0.25]
+    max: [0.15, 0.075, 0.25]
+    clip: true
+  vision_encoder:
+    obs_encoder: efficientnet-b0
+    obs_encoding_size: 256
+    mha_num_attention_heads: 4
+    mha_num_attention_layers: 4
+    mha_ff_dim_factor: 4
+    plan_fusion_layers: 2
+    depth_proj_dim: 384
+    depth_pool_dim: 64
+    dropout: 0.0
+    lingbot_depth:
+      enabled: true
+      checkpoint: robbyant/lingbot-depth-postrain-dc-vitl14
+      resolution_level: 5
+      num_tokens: null
+      use_fp16: true
+      freeze: true
+  noise_pred_net:
+    diffusion_step_embed_dim: 256
+    down_dims: [64, 128, 256]
+    kernel_size: 3
+    n_groups: 8
+    cond_predict_scale: false
+    cross_attn_heads: 4
+    cross_attn_on_all_resolutions: true
+
+intern_data:
+  plan_source: online
+  dataset_roots:
+    - /home/csevolunt/dongzhih/dataset/InternData
+  source_audit_manifest: /home/csevolunt/dongzhih/HAVANA/cosmos-predict2.5/outputs/vln_waypoint_source_audit_v2.json
+  split_seed: 5
+  val_fraction: 0.1
+  # These manifests are used only with `--plan-source offline`.
+  train_manifest: /home/csevolunt/dongzhih/HAVANA/fast_system/data/plan_latents/train_manifest.jsonl
+  val_manifest: /home/csevolunt/dongzhih/HAVANA/fast_system/data/plan_latents/val_manifest.jsonl
+  obs_image_size: 256
+  context_size: 3
+  action_horizon: 16
+  # Reason1 alone uses a fixed 10 FPS temporal window. FastNav consumes every
+  # native source frame after the Reason1 reference frame (no downsampling).
+  target_fps: 10.0
+  obs_context_dt_frames: 1
+  # Native-frame offsets: one Reason1 plan at t supervises every t+1..t+12.
+  fast_offsets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  min_depth_m: 0.1
+  max_depth_m: 5.0
+  require_full_horizon: true
+  metric_waypoint_spacing: 1.0
+  normalize_actions: true
+  pose_key: action
+  # Match inference: pass the original dataset instruction to Reason1 verbatim.
+  prompt_fields: [sub_instruction]
+  structured_prompt: false
+  max_samples: null
+
+dataloader:
+  # Four plans become 48 FastNav samples after t+1..t+12 flattening.
+  batch_size: 4
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+
+ema:
+  enabled: true
+  # Diffusion Policy EMA warmup: decay grows smoothly toward 0.9999.
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+training:
+  output_dir: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2
+  epochs: 50
+  lr: 0.0001
+  lr_scheduler: constant
+  lr_warmup_steps: 500
+  weight_decay: 0.05
+  amp: true
+  grad_clip: 1.0
+  plan_dropout_prob: 0.5
+  distance_loss_weight: 0.0001
+  save_every_steps: 5000

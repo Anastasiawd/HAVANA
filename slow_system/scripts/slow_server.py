@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Slow world-model RPC server (cosmos-predict2 venv).
+"""Slow Reason1 plan RPC server (cosmos-predict2 venv).
 
-Wraps the LoRA Video2World pipe behind a `multiprocessing.connection` listener
-so the fast system (a different venv) can request future-video predictions
-without having to import cosmos.
+Wraps the temporal waypoint model behind a ``multiprocessing.connection``
+listener so the fast process can request plan bundles without importing
+Cosmos. Legacy future-video generation remains available for compatibility.
 
 Wire format:
+    request:  ("generate_plan", recent_frames_list, instruction, seed)
+    response: {"ok": True, "result": {
+                  "reason_context": Tensor[L,1024] fp16 CPU,
+                  "context_mask": Tensor[L] bool CPU,
+                  "traj_latents": Tensor[3,3584] fp16 CPU,
+                  "elapsed": float,
+                  "schema_version": str,
+              }}
+
+Legacy video generation remains available:
     request:  ("generate", recent_frames_list, instruction, seed)
               recent_frames_list: list[np.ndarray]  (each (H,W,3) uint8)
               instruction: str
@@ -39,13 +49,13 @@ import torch
 import yaml
 from PIL import Image
 
-# Make slow_system imports work without an editable install.
-_SLOW_ROOT = Path(__file__).resolve().parents[2] / "slow_system"
-_SLOW_OSS_ROOT = _SLOW_ROOT / "packages" / "cosmos-oss"
-# The Cosmos venv may contain an editable ``cosmos_predict2`` install.  Put
-# this repository's slow_system sources first so the server cannot silently
-# import a different checkout.
-for p in reversed((_SLOW_ROOT, _SLOW_OSS_ROOT)):
+# Use the preserved, checkpoint-producing Cosmos checkout as the canonical
+# inference source. The slow_system directory contains only Havana wrappers.
+_HAVANA_ROOT = Path(__file__).resolve().parents[2]
+_SLOW_ROOT = _HAVANA_ROOT / "slow_system"
+_COSMOS_ROOT = _HAVANA_ROOT / "cosmos-predict2.5"
+_COSMOS_OSS_ROOT = _COSMOS_ROOT / "packages" / "cosmos-oss"
+for p in reversed((_COSMOS_ROOT, _COSMOS_OSS_ROOT)):
     if p.is_dir():
         source_path = str(p)
         while source_path in sys.path:
@@ -54,6 +64,7 @@ for p in reversed((_SLOW_ROOT, _SLOW_OSS_ROOT)):
 
 
 LOG = logging.getLogger("havana.slow.server")
+PLAN_SCHEMA_VERSION = "havana.reason1-plan.v2"
 
 
 def _setup_logger(level: int = logging.INFO) -> None:
@@ -73,17 +84,21 @@ def _setup_logger(level: int = logging.INFO) -> None:
 # =========================================================================== #
 @dataclass
 class SlowServerConfig:
-    checkpoint_path: str = "/home/wangdzh/Downloads/H20_weights/iter_000001000_exported"
-    checkpoint_filename: str = "model_ema_bf16.pt"
-    experiment: str = "predict2_lora_training_2b_vln_json"
+    checkpoint_path: str = str(
+        _COSMOS_ROOT
+        / "runs/cosmos_predict_v2p5/video2world_vln/2b_vln_temporal_wp_17f_full_finetune"
+        / "checkpoints/iter_000060000"
+    )
+    checkpoint_filename: str = "model.pt"
+    experiment: str = "predict2_video2world_training_2b_vln_temporal_waypoint_17f_full_finetune"
     config_file: str = ""
-    resolution: str = "192,320"
+    resolution: str = "272,480"
     # `num_conditional_frames` maps to cosmos's `num_latent_conditional_frames`
     # (must be 1 or 2). The H20 LoRA training pinned both
     # max/min_num_conditional_frames=2, so we default to 2 here to stay in
     # distribution. Set to 1 only if you really want image-conditioned mode.
     num_conditional_frames: int = 2
-    num_steps: int = 16
+    num_steps: int = 5
     guidance: int = 7
     offload_diffusion_model: bool = False
     offload_text_encoder: bool = False
@@ -158,10 +173,10 @@ class CosmosSlowEngine:
             SetupArguments,
         )
 
-        expected_inference = (_SLOW_ROOT / "cosmos_predict2" / "inference.py").resolve()
+        expected_inference = (_COSMOS_ROOT / "cosmos_predict2" / "inference.py").resolve()
         loaded_inference = Path(canonical_inference.__file__).resolve()
         expected_video2world = (
-            _SLOW_ROOT / "cosmos_predict2" / "_src" / "predict2" / "inference" / "video2world.py"
+            _COSMOS_ROOT / "cosmos_predict2" / "_src" / "predict2" / "inference" / "video2world.py"
         ).resolve()
         loaded_video2world = Path(video2world_inference.__file__).resolve()
         if loaded_inference != expected_inference or loaded_video2world != expected_video2world:
@@ -207,11 +222,19 @@ class CosmosSlowEngine:
         )
         self._inference = Inference(setup_args)
         self._pipe = self._inference.pipe
+        self._pipe.model.eval()
         self._negative_prompt = DEFAULT_NEGATIVE_PROMPT
         try:
             self._req_frames = int(self._pipe.model.tokenizer.get_pixel_num_frames(self._pipe.model.config.state_t))
         except Exception:  # noqa: BLE001
             self._req_frames = 77
+        if self._req_frames != 17:
+            raise RuntimeError(f"Temporal Reason1 plan contract requires 17 frames, loaded {self._req_frames}.")
+        if (self._h, self._w) != (272, 480):
+            raise ValueError(f"Temporal Reason1 plan contract requires resolution 272x480, got {self._h}x{self._w}.")
+        if int(self.cfg.num_conditional_frames) != 2:
+            raise ValueError("Temporal Reason1 plan contract requires two latent conditional frames (RGB positions 0-4).")
+        self._load_diagnostics = self._diagnose_loaded_plan_model(ckpt)
         LOG.info("pipe ready in %.1fs (model_required_frames=%d, resolution=%dx%d)",
                  time.time() - t0, self._req_frames, self._h, self._w)
 
@@ -221,7 +244,74 @@ class CosmosSlowEngine:
 
     @property
     def info(self) -> dict:
-        return {"resolution": (self._h, self._w), "num_frames": self._req_frames}
+        return {
+            "resolution": (self._h, self._w),
+            "num_frames": self._req_frames,
+            "condition_frame_positions": (0, 1, 2, 3, 4),
+            "fps": 10.0,
+            "plan_schema_version": PLAN_SCHEMA_VERSION,
+            "load_diagnostics": self._load_diagnostics,
+        }
+
+    def _diagnose_loaded_plan_model(self, checkpoint: Path) -> dict:
+        model = self._pipe.model
+        expected_name = "VLNTemporalWaypointVideo2WorldModelRectifiedFlow"
+        if type(model).__name__ != expected_name:
+            raise TypeError(f"Expected {expected_name}, loaded {type(model).__name__}.")
+        modules = {
+            "reason1": getattr(model, "trajectory_reason_encoder", None),
+            "reason2_to_dit_proj": getattr(model, "reason2_to_dit_proj", None),
+        }
+        missing = [name for name, module in modules.items() if module is None]
+        if missing:
+            raise RuntimeError(f"Plan checkpoint is missing required modules: {missing}")
+        counts = {name: sum(value.numel() for value in module.parameters()) for name, module in modules.items()}
+        empty = [name for name, count in counts.items() if count <= 0]
+        if empty:
+            raise RuntimeError(f"Plan modules have no parameters after checkpoint load: {empty}")
+        traj_tokens = int(getattr(modules["reason1"], "num_traj_tokens", -1))
+        if traj_tokens != 3:
+            raise RuntimeError(f"Temporal plan requires three trajectory tokens, loaded {traj_tokens}.")
+        diagnostics = {
+            "checkpoint": str(checkpoint),
+            "model_class": type(model).__name__,
+            "parameter_counts": counts,
+            "num_trajectory_tokens": traj_tokens,
+            "checkpoint_keys": self._audit_checkpoint_keys(checkpoint),
+        }
+        LOG.info("plan load diagnostics: %s", diagnostics)
+        return diagnostics
+
+    @staticmethod
+    def _audit_checkpoint_keys(checkpoint: Path) -> dict:
+        """Confirm the exported file contains every plan-specific weight family."""
+        try:
+            payload = torch.load(str(checkpoint), map_location="cpu", weights_only=False, mmap=True)
+        except TypeError:
+            payload = torch.load(str(checkpoint), map_location="cpu", mmap=True)
+
+        candidates = []
+        if isinstance(payload, dict):
+            candidates.append(payload)
+            candidates.extend(value for value in payload.values() if isinstance(value, dict))
+        state = max(
+            candidates,
+            key=lambda value: sum(torch.is_tensor(tensor) for tensor in value.values()),
+            default={},
+        )
+        keys = [str(key) for key, value in state.items() if torch.is_tensor(value)]
+        required = {
+            "reason1": "trajectory_reason_encoder.",
+            "reason2_to_dit_proj": "reason2_to_dit_proj.",
+        }
+        matches = {name: sum(prefix in key for key in keys) for name, prefix in required.items()}
+        missing = [name for name, count in matches.items() if count == 0]
+        del payload, candidates, state
+        if missing:
+            raise RuntimeError(
+                f"Exported checkpoint {checkpoint} lacks required plan weight families: {missing}."
+            )
+        return matches
 
     def _build_input_video(self, recent: List[np.ndarray]) -> torch.Tensor:
         H, W, T = self._h, self._w, self._req_frames
@@ -273,14 +363,8 @@ class CosmosSlowEngine:
             except Exception:  # noqa: BLE001
                 pass
 
-        if self.cfg.offload_text_encoder:
-            offload_reason = getattr(model, "offload_reason_conditioner_for_inference", None)
-            if callable(offload_reason):
-                try:
-                    offload_reason()
-                    moved.append("trajectory_reason_conditioner")
-                except Exception:  # noqa: BLE001
-                    pass
+        if self.cfg.offload_text_encoder and self._offload_reason_conditioner(model):
+            moved.append("trajectory_reason_conditioner")
 
         # 2. Tokenizer encoder + decoder.
         tok = getattr(model, "tokenizer", None)
@@ -356,12 +440,86 @@ class CosmosSlowEngine:
                 self._force_unload_to_cpu()
         return np.ascontiguousarray(out)
 
+    @torch.inference_mode()
+    def generate_plan(self, recent: List[np.ndarray], instruction: str, seed: int) -> dict:
+        """Run only temporal Reason1 and return semantic context/trajectory tokens."""
+        del seed  # Reason1 eval is deterministic; kept in the wire contract.
+        if self._pipe is None:
+            raise RuntimeError("slow pipe not initialised")
+        vid_input = self._build_input_video(recent)
+        model = self._pipe.model
+        t0 = time.time()
+        try:
+            data_batch = self._pipe._get_data_batch_input(
+                video=vid_input,
+                prompt=instruction,
+                num_conditional_frames=int(self.cfg.num_conditional_frames),
+                negative_prompt=self._negative_prompt,
+                use_neg_prompt=False,
+            )
+            model.trajectory_reason_encoder.to(device="cuda")
+            model.trajectory_reason_encoder.model.eval()
+            model.reason2_to_dit_proj.to(**model.tensor_kwargs)
+            reason_output = model.trajectory_reason_encoder(data_batch, model.input_caption_key)
+            reason_context = model.reason2_to_dit_proj(
+                reason_output.context_tokens.to(**model.tensor_kwargs)
+            )
+
+            result = {
+                "reason_context": reason_context[0].detach().to(device="cpu", dtype=torch.float16).contiguous(),
+                "context_mask": reason_output.context_mask[0].detach().to(device="cpu", dtype=torch.bool).contiguous(),
+                "traj_latents": reason_output.traj_latents[0]
+                .detach()
+                .to(device="cpu", dtype=torch.float16)
+                .contiguous(),
+                "elapsed": time.time() - t0,
+                "schema_version": PLAN_SCHEMA_VERSION,
+                "instruction": str(instruction),
+            }
+            expected = {
+                "reason_context": (None, 1024),
+                "traj_latents": (3, 3584),
+            }
+            for name, shape in expected.items():
+                actual = tuple(result[name].shape)
+                if shape[0] is None:
+                    valid = len(actual) == 2 and actual[1] == shape[1]
+                else:
+                    valid = actual == shape
+                if not valid:
+                    raise ValueError(f"Unexpected {name} shape {actual}; expected {shape}.")
+            if result["context_mask"].shape != result["reason_context"].shape[:1]:
+                raise ValueError("Reason1 context mask length does not match context length.")
+            if not result["context_mask"].any():
+                raise ValueError("Reason1 returned a plan with no valid context tokens.")
+            return result
+        finally:
+            del vid_input
+            if self.cfg.offload_text_encoder:
+                self._offload_reason_conditioner(model)
+
+    @staticmethod
+    def _offload_reason_conditioner(model) -> bool:
+        offload = getattr(model, "offload_reason_conditioner_for_inference", None)
+        if callable(offload):
+            offload()
+            return True
+        moved = False
+        for name in ("trajectory_reason_encoder", "reason2_to_dit_proj", "waypoint_head"):
+            module = getattr(model, name, None)
+            if module is not None:
+                setattr(model, name, module.to(device="cpu"))
+                moved = True
+        if moved:
+            torch.cuda.empty_cache()
+        return moved
+
 
 # =========================================================================== #
 # RPC loop
 # =========================================================================== #
 class SlowRpcServer:
-    _OPS = {"ping", "info", "set_resolution", "generate"}
+    _OPS = {"ping", "info", "set_resolution", "generate", "generate_plan"}
 
     def __init__(self, engine: CosmosSlowEngine, address: str, authkey: bytes):
         self.engine = engine
@@ -431,8 +589,11 @@ class SlowRpcServer:
         if op == "info":
             return self.engine.info
         if op == "set_resolution":
-            self.engine._h, self.engine._w = self.engine._parse_resolution(args[0])
-            self.engine.cfg.resolution = args[0]
+            resolution = self.engine._parse_resolution(args[0])
+            if resolution != (272, 480):
+                raise ValueError("Temporal plan server resolution is fixed at 272,480.")
+            self.engine._h, self.engine._w = resolution
+            self.engine.cfg.resolution = "272,480"
             return None
         if op == "generate":
             recent_list, instruction, seed = args[0], args[1], int(args[2])
@@ -441,6 +602,16 @@ class SlowRpcServer:
             elapsed = time.time() - t0
             LOG.info("generated video shape=%s in %.2fs", video.shape, elapsed)
             return {"video": video, "elapsed": elapsed}
+        if op == "generate_plan":
+            recent_list, instruction, seed = args[0], args[1], int(args[2])
+            plan = self.engine.generate_plan(recent_list, instruction, seed)
+            LOG.info(
+                "generated plan context=%d trajectory_tokens=%d in %.2fs",
+                int(plan["context_mask"].sum()),
+                int(plan["traj_latents"].shape[0]),
+                plan["elapsed"],
+            )
+            return plan
         raise AssertionError(f"unhandled op {op!r}")
 
 

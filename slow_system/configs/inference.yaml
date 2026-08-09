@@ -1,7 +1,7 @@
 # Slow system direct inference config
 # Consumed by slow_system/scripts/inference.py
 
-checkpoint_path: /home/wangdzh/Downloads/augmented_iter_26000
+checkpoint_path: /home/csevolunt/dongzhih/cosmos-predict2.5/runs/cosmos_predict_v2p5/video2world_vln/2b_vln_temporal_wp_17f_full_finetune/checkpoints/iter_000060000
 checkpoint_filename: model_ema_bf16.pt
 experiment: predict2_video2world_training_2b_vln_online_reason2_align_29f_10fps_272_480
 config_file: ""
@@ -10,7 +10,7 @@ config_file: ""
 reason1_ckpt_path: ""
 
 # Input/output settings
-input_images: ["/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg", "/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg", "/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg","/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg","/home/wangdzh/data/1LXtFkjw3qL/videos/chunk-000/observation.images.rgb.125cm_30deg/episode_000029_0.jpg"]
+input_images: []
 output_dir: ./outputs
 save_video: true
 save_frames: false

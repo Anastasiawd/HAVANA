@@ -5,8 +5,8 @@ seed: 0
 device: cuda
 
 vjepa2:
-  repo: /home/wangdzh/ffnav/vjepa2
-  checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/vjepa2_1_vitl_dist_vitG_384.pt
+  repo: /home/csevolunt/dongzhih/vjepa2
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/model_weights/vjepa2_1_vitl_dist_vitG_384.pt
   model_name: vjepa2_1_vit_large_384
   checkpoint_key: ema_encoder
   image_size: 256
@@ -61,8 +61,8 @@ stage1_head:
   dropout: 0.1
 
 scand_data:
-  train_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_train_index.jsonl
-  val_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_val_index.jsonl
+  train_index: /home/csevolunt/dongzhih/HAVANA/fast_system/data_preparation/mix_stage1_train_index.jsonl
+  val_index: /home/csevolunt/dongzhih/HAVANA/fast_system/data_preparation/mix_stage1_val_index.jsonl
   image_size: ${vjepa2.image_size}
   frame_tolerance_ns: 250000000
   dtype: float32
@@ -70,7 +70,7 @@ scand_data:
   max_samples: null
 
 data:
-  latents_root: /home/wangdzh/ffnav/havana/RouteQueryAdapter/data_preparation/recon_latents
+  latents_root: /home/csevolunt/dongzhih/HAVANA/fast_system/data_preparation/recon_latents
   feature_key: feature
   pattern: clip_*.pt
   recursive: true
@@ -102,7 +102,7 @@ dataloader:
   timeout: 120
 
 training:
-  output_dir: /home/wangdzh/ffnav/havana/fast_system/checkpoints/stage1
+  output_dir: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/stage1
   epochs: 50
   lr: 0.0001
   weight_decay: 0.05

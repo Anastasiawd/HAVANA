@@ -66,6 +66,18 @@ class VideoCrossAttention(nn.Module):
 
         self.attn_dropout = dropout
 
+    @staticmethod
+    def _action_position_encoding(length: int, channels: int, device, dtype) -> torch.Tensor:
+        """Fixed 1-D encoding so equal-valued action slots remain distinguishable."""
+        half = max(1, channels // 2)
+        positions = torch.linspace(-1.0, 1.0, length, device=device, dtype=torch.float32).unsqueeze(1)
+        frequencies = torch.exp(
+            torch.arange(half, device=device, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0, device=device)) / max(half - 1, 1))
+        ).unsqueeze(0)
+        encoding = torch.cat((torch.sin(positions * frequencies), torch.cos(positions * frequencies)), dim=1)
+        return encoding[:, :channels].to(dtype=dtype)
+
     def forward(
         self,
         x: torch.Tensor,                       # [B, C, L]
@@ -85,6 +97,7 @@ class VideoCrossAttention(nn.Module):
         # normalize in channel dim, then move to [B, L, C] for linear layers
         h = self.norm(x)
         h = h.transpose(1, 2)  # [B, L, C]
+        h = h + self._action_position_encoding(L, C, h.device, h.dtype).unsqueeze(0)
 
         q = self.to_q(h)  # [B, L, C]
         kv = self.context_proj(context)  # [B, N, 2C]
@@ -216,6 +229,7 @@ class ConditionalUnet1D(nn.Module):
         cross_attn_on_mid: bool = True,
         cross_attn_on_deepest_down: bool = True,
         cross_attn_on_deepest_up: bool = True,
+        cross_attn_on_all_resolutions: bool = False,
         ):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
@@ -325,6 +339,8 @@ class ConditionalUnet1D(nn.Module):
         self.mid_cross_attn = None
         self.down_cross_attn = None
         self.up_cross_attn = None
+        self.down_cross_attn_layers = nn.ModuleList()
+        self.up_cross_attn_layers = nn.ModuleList()
 
         if context_dim is not None:
             mid_channels = all_dims[-1]
@@ -351,6 +367,25 @@ class ConditionalUnet1D(nn.Module):
                     channels=deepest_up_channels,
                     context_dim=context_dim,
                     num_heads=cross_attn_heads,
+                )
+            if cross_attn_on_all_resolutions:
+                self.down_cross_attn = None
+                self.up_cross_attn = None
+                self.down_cross_attn_layers = nn.ModuleList(
+                    VideoCrossAttention(
+                        channels=dim_out,
+                        context_dim=context_dim,
+                        num_heads=cross_attn_heads,
+                    )
+                    for _, dim_out in in_out
+                )
+                self.up_cross_attn_layers = nn.ModuleList(
+                    VideoCrossAttention(
+                        channels=dim_in,
+                        context_dim=context_dim,
+                        num_heads=cross_attn_heads,
+                    )
+                    for dim_in, _ in reversed(in_out[1:])
                 )
 
         logger.info(
@@ -428,6 +463,9 @@ class ConditionalUnet1D(nn.Module):
             if idx == 0 and len(h_local) > 0:
                 x = x + h_local[0]
             x = resnet2(x, global_feature)
+            if self.down_cross_attn_layers:
+                cross_attn = self.down_cross_attn_layers[idx]
+                x = cross_attn(x, context, context_mask, None)
             # Cross-attention after the deepest down block, before its (Identity) downsample.
             if idx == num_down - 1 and self.down_cross_attn is not None:
                 tbias = self._build_temporal_bias_for(
@@ -457,6 +495,9 @@ class ConditionalUnet1D(nn.Module):
             if idx == len(self.up_modules) and len(h_local) > 0:
                 x = x + h_local[1]
             x = resnet2(x, global_feature)
+            if self.up_cross_attn_layers:
+                cross_attn = self.up_cross_attn_layers[idx]
+                x = cross_attn(x, context, context_mask, None)
             # Cross-attention after the deepest (idx=0) up block's resnet2, before upsample.
             if idx == 0 and self.up_cross_attn is not None:
                 tbias = self._build_temporal_bias_for(
@@ -470,4 +511,3 @@ class ConditionalUnet1D(nn.Module):
 
         x = einops.rearrange(x, 'b t h -> b h t')
         return x
-

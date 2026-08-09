@@ -15,9 +15,9 @@ import torch.nn.functional as F
 from torch import nn
 
 
-DEFAULT_VJEPA2_ROOT = Path("/home/wangdzh/ffnav/vjepa2")
+DEFAULT_VJEPA2_ROOT = Path("/home/csevolunt/dongzhih/vjepa2")
 DEFAULT_VJEPA2_CHECKPOINT = Path(
-    "/home/wangdzh/ffnav/havana/RouteQueryAdapter/data_preparation/model_weights/vjepa2_1_vitb_dist_vitG_384.pt"
+    "/home/csevolunt/dongzhih/HAVANA/fast_system/model_weights/vjepa2_1_vitb_dist_vitG_384.pt"
 )
 
 
@@ -390,6 +390,7 @@ class RouteQFormer(nn.Module):
         self,
         visual_tokens: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,
+        query_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         visual_tokens, token_mask = self._flatten_visual_tokens(visual_tokens, token_mask)
         if visual_tokens.shape[-1] != self.input_dim:
@@ -397,7 +398,23 @@ class RouteQFormer(nn.Module):
 
         visual_tokens = self.visual_norm(self.visual_proj(visual_tokens))
         batch_size = visual_tokens.shape[0]
-        queries = self.route_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        if query_tokens is None:
+            queries = self.route_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            if query_tokens.ndim == 2:
+                query_tokens = query_tokens.unsqueeze(0)
+            if query_tokens.ndim != 3 or query_tokens.shape[-1] != self.hidden_dim:
+                raise ValueError(
+                    "query_tokens must have shape [Q,hidden_dim] or [B,Q,hidden_dim]; "
+                    f"got {tuple(query_tokens.shape)}."
+                )
+            if query_tokens.shape[0] == 1 and batch_size != 1:
+                query_tokens = query_tokens.expand(batch_size, -1, -1)
+            elif query_tokens.shape[0] != batch_size:
+                raise ValueError(
+                    f"query_tokens batch {query_tokens.shape[0]} does not match visual token batch {batch_size}."
+                )
+            queries = query_tokens.to(device=visual_tokens.device, dtype=visual_tokens.dtype)
         queries = self.query_dropout(queries)
 
         key_padding_mask = None

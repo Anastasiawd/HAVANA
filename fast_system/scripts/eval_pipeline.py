@@ -127,7 +127,11 @@ def make_autocast(device: torch.device, enabled: bool):
 
 def action_stats_from_cfg(cfg: Mapping[str, Any]) -> dict[str, Sequence[float]]:
     stats = cfg.get("model", {}).get("action_stats", DEFAULT_ACTION_STATS)
-    return {"min": tuple(stats["min"]), "max": tuple(stats["max"])}
+    return {
+        "min": tuple(stats["min"]),
+        "max": tuple(stats["max"]),
+        "clip": bool(stats.get("clip", False)),
+    }
 
 
 def flatten_async(batch: dict[str, Any], z_goal: torch.Tensor) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
@@ -154,8 +158,8 @@ def flatten_async(batch: dict[str, Any], z_goal: torch.Tensor) -> tuple[dict[str
 
 def trajectory_metrics(pred: torch.Tensor, gt: torch.Tensor, scale: float) -> dict[str, np.ndarray]:
     """Per-sample ADE / FDE in meters.  pred, gt: [N, H, 2] in normalized units."""
-    pred_m = pred * scale
-    gt_m = gt * scale
+    pred_m = pred[..., :2] * scale
+    gt_m = gt[..., :2] * scale
     err = torch.linalg.norm(pred_m - gt_m, dim=-1)  # [N, H]
     ade = err.mean(dim=-1).cpu().numpy()
     fde = err[:, -1].cpu().numpy()
@@ -166,8 +170,9 @@ def trajectory_metrics(pred: torch.Tensor, gt: torch.Tensor, scale: float) -> di
 def sample_traj(
     model: torch.nn.Module,
     obs: torch.Tensor,
-    z_goal: torch.Tensor,
+    plan_tokens: torch.Tensor,
     *,
+    depth: torch.Tensor | None = None,
     horizon: int,
     action_dim: int,
     steps: int,
@@ -177,13 +182,16 @@ def sample_traj(
     device: torch.device,
     amp: bool,
 ) -> torch.Tensor:
-    """Sample `num_samples` trajectories, return mean prediction [N, H, 2]."""
+    """Sample trajectories from the strict RGB-D token-conditioned policy."""
+    if depth is None:
+        raise ValueError("FastNav sampling requires a current metric-depth tensor.")
     accum = None
     for _ in range(max(1, num_samples)):
         with make_autocast(device, amp):
             traj = model.sample_actions(
                 obs_img=obs,
-                z_goal=z_goal,
+                depth=depth,
+                plan_tokens=plan_tokens,
                 pred_horizon=horizon,
                 action_dim=action_dim,
                 steps=steps,

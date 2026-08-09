@@ -1,0 +1,37 @@
+instruction: ""
+obs_history_len: 32
+slow_replan_interval: 12
+slow_min_obs: 5
+slow_input_frames: 5
+target_fps: 10.0
+fast_sleep_time: 0.0
+device: cuda
+seed: 0
+log_level: INFO
+
+fast:
+  config_path: /home/csevolunt/dongzhih/HAVANA/fast_system/configs/plan_stage2.yaml
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2/last.pt
+  cfm_steps: 5
+  num_trajectory_samples: 1
+  use_amp: true
+
+slow:
+  enabled: true
+  remote_address: /tmp/havana-slow.sock
+  remote_authkey: havana-slow
+  connect_timeout: 120.0
+  seed: 0
+
+adapter:
+  turn_threshold_rad: 0.1745
+  forward_threshold_m: 0.01
+  stop_threshold_m: 0.05
+  lookahead_index: 4
+
+debug:
+  enabled: true
+  output_dir: /home/csevolunt/dongzhih/HAVANA/havana_debug
+  fps: 10.0
+  queue_size: 64
+  save_slow_video: false

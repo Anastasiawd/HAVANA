@@ -4,12 +4,10 @@
 Pipeline (one server, two threads)
     Thread A — Fast Policy Loop (main thread of the simulator step loop):
         observation_t           -> ring buffer
-        observation_t + z_g_v   -> Stage-2 (CFM) -> trajectory
+        observation_t + plan_v  -> PlanEncoder + Stage-2 (CFM) -> trajectory
         trajectory              -> TrajectoryActionAdapter -> Habitat action
     Thread B — Slow Replan Worker (background daemon, queue depth = 1):
-        recent obs frames + instruction -> Slow World Model (Cosmos LoRA)
-                                       -> future video
-                                       -> Stage-1 -> z_g (atomic update)
+        recent RGB frames + instruction -> Cosmos Reason1 plan (atomic update)
 
 Top-level usage from `eval_fast.py`:
 
@@ -33,9 +31,8 @@ The class-based public API:
     server.set_instruction(text)                 # change the language prompt mid-run
     server.start() / server.stop()               # explicit lifecycle
 
-Slow system can be disabled (`slow_system.enabled: false` in YAML) for fast-only
-debugging. In that mode the server runs Stage-2 with `input_goal_mask=1` so the
-trained "no-goal" path is exercised, and z_g defaults to a zero tensor.
+The slow system can be disabled for RGB-D-only debugging. In that mode Stage-2
+uses a zero plan with ``input_goal_mask=1``.
 """
 from __future__ import annotations
 
@@ -44,7 +41,6 @@ import argparse
 import collections
 import logging
 import math
-import os
 import sys
 import threading
 import time
@@ -82,10 +78,13 @@ if _DIFFUSION_POLICY_SRC.is_dir() and str(_DIFFUSION_POLICY_SRC) not in sys.path
 # fast_system imports -------------------------------------------------------- #
 from fast_system.scripts.eval_pipeline import (  # noqa: E402
     action_stats_from_cfg,
-    load_stage1,
-    load_stage2,
     make_autocast,
     sample_traj,
+)
+from fast_system.model.nav_model import build_fast_nav_model  # noqa: E402
+from fast_system.model.plan_encoder import (  # noqa: E402
+    PLAN_SCHEMA_VERSION,
+    build_plan_encoder,
 )
 from fast_system.trainer.train_stage_2 import (  # noqa: E402
     load_config as load_stage2_config,
@@ -119,12 +118,11 @@ def setup_logger(level: int = logging.INFO) -> None:
 # =========================================================================== #
 @dataclass
 class FastSystemConfig:
-    """Runtime knobs for the fast (Stage-1 + Stage-2) pipeline."""
+    """Runtime knobs for the jointly-trained PlanEncoder + Stage-2 policy."""
 
-    config_path: str = str(FAST_SYSTEM_ROOT / "configs" / "stage2.yaml")
-    stage1_ckpt: str = str(FAST_SYSTEM_ROOT / "model_weights" / "stage1.pt")
-    stage2_ckpt: str = str(FAST_SYSTEM_ROOT / "model_weights" / "stage2.pt")
-    cfm_steps: int = 10
+    config_path: str = str(FAST_SYSTEM_ROOT / "configs" / "plan_stage2.yaml")
+    checkpoint: str = str(FAST_SYSTEM_ROOT / "checkpoints" / "plan_stage2" / "last.pt")
+    cfm_steps: int = 5
     num_trajectory_samples: int = 1
     use_amp: bool = True
 
@@ -141,7 +139,6 @@ class SlowSystemConfig:
     remote_address: str = "/tmp/havana-slow.sock"   # unix socket path or host:port
     remote_authkey: str = "havana-slow"
     connect_timeout: float = 60.0                   # wait for the slow server to come up
-    num_output_frames: int = 77                     # informational fallback if info() fails
     seed: int = 0
 
 
@@ -157,13 +154,13 @@ class ActionAdapterConfig:
 
 @dataclass
 class DebugConfig:
-    """Debug visualisation: side-by-side mp4 of obs + BEV + slow future-frame."""
+    """Debug visualisation for RGB and fast trajectories."""
 
     enabled: bool = False
     output_dir: str = "/tmp/havana_debug"
     fps: float = 4.0
     queue_size: int = 32
-    save_slow_video: bool = True   # also dump each replan's predicted future as its own mp4
+    save_slow_video: bool = False  # deprecated compatibility option
 
 
 @dataclass
@@ -172,11 +169,10 @@ class PipelineConfig:
 
     instruction: str = "Walk forward and explore the room."
     obs_history_len: int = 32
-    slow_replan_interval: int = 8       # trigger slow worker every N fast steps
-    slow_min_obs: int = 2               # need ≥ this many frames before first slow replan
-    slow_video_frames: int = 8          # how many recent obs frames to send to slow system
-    target_fps: float = 4.0             # frames-per-second cadence used for stage1 / slow input
-    route_window: int = 16              # Stage-1 input window (matches training)
+    slow_replan_interval: int = 12      # trigger Reason1 every N fast steps
+    slow_min_obs: int = 5               # five fixed conditional RGB frames
+    slow_input_frames: int = 5
+    target_fps: float = 10.0
     fast_sleep_time: float = 0.0        # sleep after each fast tick (lets slow catch up)
     device: str = "cuda"
     seed: int = 0
@@ -257,12 +253,12 @@ class StoredFrame:
 
     step_id: int
     rgb: np.ndarray                         # (H, W, 3) uint8
-    depth: Optional[np.ndarray] = None      # (H, W) float32 — may be unused
+    depth_m: np.ndarray                     # (H, W) float32 meters
     timestamp: float = 0.0
 
 
 class ObservationRingBuffer:
-    """Thread-safe ring buffer of recent RGB (and optional depth) frames."""
+    """Thread-safe ring buffer of recent RGB frames."""
 
     def __init__(self, capacity: int):
         self._capacity = max(1, int(capacity))
@@ -294,55 +290,87 @@ class ObservationRingBuffer:
 # =========================================================================== #
 # Shared latent state
 # =========================================================================== #
+def validate_plan_bundle(plan: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """Validate the cross-process plan contract and canonicalize it on CPU."""
+    if str(plan.get("schema_version", "")) != PLAN_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported plan schema {plan.get('schema_version')!r}; expected {PLAN_SCHEMA_VERSION!r}."
+        )
+    expected = {
+        "reason_context": (None, 1024),
+        "context_mask": (None,),
+        "traj_latents": (3, 3584),
+    }
+    out: Dict[str, torch.Tensor] = {}
+    for name, shape in expected.items():
+        value = plan.get(name)
+        if not torch.is_tensor(value):
+            raise TypeError(f"Plan field {name!r} must be a tensor, got {type(value).__name__}.")
+        actual = tuple(value.shape)
+        valid = (
+            len(actual) == len(shape)
+            and all(want is None or got == want for got, want in zip(actual, shape))
+        )
+        if not valid:
+            raise ValueError(f"Plan field {name!r} has shape {actual}; expected {shape}.")
+        out[name] = value.detach().cpu().contiguous()
+    if out["reason_context"].shape[0] != out["context_mask"].shape[0]:
+        raise ValueError("Plan context and context_mask lengths differ.")
+    out["context_mask"] = out["context_mask"].bool()
+    if not out["context_mask"].any():
+        raise ValueError("Plan has no valid Reason1 context tokens.")
+    out["reason_context"] = out["reason_context"].half()
+    out["traj_latents"] = out["traj_latents"].half()
+    if not all(torch.isfinite(value).all() for name, value in out.items() if name != "context_mask"):
+        raise ValueError("Plan contains non-finite tensor values.")
+    return out
+
+
 @dataclass(frozen=True)
-class LatentInfo:
-    z_g: torch.Tensor          # [z_dim] on the fast system's device
+class PlanBundleInfo:
+    reason_context: torch.Tensor  # [L,1024] fp16 CPU
+    context_mask: torch.Tensor    # [L] bool CPU
+    traj_latents: torch.Tensor    # [3,3584] fp16 CPU
     version: int               # monotonic, 0 = none
     source_step: int           # fast-loop step that triggered the slow replan
     timestamp: float
-    # Stage-1 decode artefacts (CPU numpy) — kept here so the debug visualizer
-    # can render the goal/anchors that *go with* this z_g without a second
-    # forward pass. None when the slow path didn't run (e.g. stub backend).
-    goal_xy: Optional[np.ndarray] = None        # (2,) coarse goal in meters
-    anchors_xy: Optional[np.ndarray] = None     # (K, 2) anchor waypoints in meters
-    turn_probs: Optional[np.ndarray] = None     # (3,) softmax over [left, straight, right]
-    slow_video_u8: Optional[np.ndarray] = None  # (T, H, W, 3) uint8 future video
+    elapsed: float = 0.0
+    schema_version: str = PLAN_SCHEMA_VERSION
+    instruction: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-class SharedLatentState:
-    """Atomic single-writer / many-readers exchange for the latest z_g."""
+class PlanBundleState:
+    """Atomic single-writer / many-reader exchange for a complete plan."""
 
     def __init__(self):
-        self._info: Optional[LatentInfo] = None
+        self._info: Optional[PlanBundleInfo] = None
         self._lock = threading.Lock()
         self._counter = 0
 
     def update(
         self,
-        z_g: torch.Tensor,
+        plan: Dict[str, Any],
         source_step: int,
-        *,
-        goal_xy: Optional[np.ndarray] = None,
-        anchors_xy: Optional[np.ndarray] = None,
-        turn_probs: Optional[np.ndarray] = None,
-        slow_video_u8: Optional[np.ndarray] = None,
     ) -> int:
-        z_g = z_g.detach().clone()
+        tensors = validate_plan_bundle(plan)
         with self._lock:
             self._counter += 1
-            self._info = LatentInfo(
-                z_g=z_g,
+            self._info = PlanBundleInfo(
+                reason_context=tensors["reason_context"].clone(),
+                context_mask=tensors["context_mask"].clone(),
+                traj_latents=tensors["traj_latents"].clone(),
                 version=self._counter,
                 source_step=source_step,
                 timestamp=time.time(),
-                goal_xy=goal_xy,
-                anchors_xy=anchors_xy,
-                turn_probs=turn_probs,
-                slow_video_u8=slow_video_u8,
+                elapsed=float(plan.get("elapsed", 0.0)),
+                schema_version=str(plan.get("schema_version", PLAN_SCHEMA_VERSION)),
+                instruction=str(plan.get("instruction", "")),
+                metadata=dict(plan.get("metadata", {})),
             )
             return self._counter
 
-    def get(self) -> Optional[LatentInfo]:
+    def get(self) -> Optional[PlanBundleInfo]:
         with self._lock:
             return self._info
 
@@ -363,7 +391,7 @@ class TrajectoryActionAdapter:
 
     Logic (intentionally minimal — extend later):
         1. Pick a near-future waypoint (`lookahead_index`).
-        2. heading_error = atan2(y, x).
+        2. heading_error comes from the predicted yaw channel.
         3. |heading_error| > turn_threshold_rad ->
               y > 0 -> turn_left, else -> turn_right
         4. else x > forward_threshold_m -> move_forward
@@ -386,7 +414,7 @@ class TrajectoryActionAdapter:
                         missing)
 
     def convert(self, trajectory_m: np.ndarray, *, step_id: int) -> Tuple[Optional[str], str]:
-        """trajectory_m: [H, 2] in meters (x forward, y left). Returns (action_name, reason)."""
+        """trajectory_m: [H,3] as (x forward, y left, yaw)."""
         if trajectory_m is None or trajectory_m.size == 0:
             return self.stop, "empty trajectory -> stop"
 
@@ -395,15 +423,19 @@ class TrajectoryActionAdapter:
         wp = trajectory_m[idx]
         x_fwd = float(wp[0])
         y_left = float(wp[1])
-        heading = math.atan2(y_left, x_fwd) if (x_fwd != 0.0 or y_left != 0.0) else 0.0
+        heading = (
+            float((float(wp[2]) + math.pi) % (2.0 * math.pi) - math.pi)
+            if wp.shape[0] >= 3
+            else (math.atan2(y_left, x_fwd) if (x_fwd != 0.0 or y_left != 0.0) else 0.0)
+        )
         dist = math.hypot(x_fwd, y_left)
 
         # Decide
         if abs(heading) > self.cfg.turn_threshold_rad:
-            if y_left > 0 and self.left is not None:
+            if heading > 0 and self.left is not None:
                 action = self.left
                 reason = "heading_error %.2frad > %.2f -> turn_left" % (heading, self.cfg.turn_threshold_rad)
-            elif y_left <= 0 and self.right is not None:
+            elif heading <= 0 and self.right is not None:
                 action = self.right
                 reason = "heading_error %.2frad < -%.2f -> turn_right" % (heading, self.cfg.turn_threshold_rad)
             else:
@@ -453,53 +485,54 @@ def to_chw_float(frame_u8: np.ndarray, size: Tuple[int, int]) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def _coerce_depth_m(depth: np.ndarray, min_depth_m: float = 0.1, max_depth_m: float = 5.0) -> np.ndarray:
+    arr = np.asarray(depth)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected depth with shape (H,W) or (H,W,1), got {arr.shape}.")
+    if np.issubdtype(arr.dtype, np.integer):
+        arr = arr.astype(np.float32) / 10000.0
+    else:
+        arr = arr.astype(np.float32, copy=False)
+    valid = np.isfinite(arr) & (arr >= float(min_depth_m)) & (arr <= float(max_depth_m))
+    return np.ascontiguousarray(np.where(valid, arr, 0.0), dtype=np.float32)
+
+
+def to_depth_float(depth_m: np.ndarray, size: Tuple[int, int]) -> torch.Tensor:
+    image = Image.fromarray(np.asarray(depth_m, dtype=np.float32), mode="F")
+    if image.size != size:
+        image = image.resize(size, getattr(Image, "Resampling", Image).NEAREST)
+    return torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).contiguous()
+
+
 # =========================================================================== #
 # Slow system backends
 # =========================================================================== #
 class SlowBackend:
-    """Abstract: produces a future-video tensor (T, 3, H, W) in [0, 1] floats."""
+    """Abstract Reason1 plan backend."""
 
     def is_real(self) -> bool:
         return False
 
-    def generate(
+    def generate_plan(
         self,
         recent_frames_u8: List[np.ndarray],
         instruction: str,
         seed: int,
-    ) -> torch.Tensor:
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
 
 class StubSlowBackend(SlowBackend):
-    """Echo the most recent observation as a 'future' video.
+    """Disabled backend; the fast runner will use its masked RGB-D-only path."""
 
-    For development / debugging — does not actually run the slow world model.
-    """
-
-    def __init__(self, num_frames: int, image_size: int):
-        self.num_frames = int(num_frames)
-        self.image_size = int(image_size)
-
-    def generate(self, recent_frames_u8, instruction, seed) -> torch.Tensor:
-        size = (self.image_size, self.image_size)
-        if not recent_frames_u8:
-            blank = torch.zeros(3, *size)
-            return blank.unsqueeze(0).expand(self.num_frames, -1, -1, -1).clone()
-        frames = [to_chw_float(f, size) for f in recent_frames_u8[-self.num_frames:]]
-        # Repeat the last frame to fill the future window.
-        while len(frames) < self.num_frames:
-            frames.append(frames[-1].clone())
-        return torch.stack(frames, dim=0)
+    def generate_plan(self, recent_frames_u8, instruction, seed) -> Dict[str, Any]:
+        raise RuntimeError("Reason1 plan backend is disabled")
 
 
 class RemoteSlowBackend(SlowBackend):
-    """Talks to `slow_system/scripts/slow_server.py` over multiprocessing.connection.
-
-    The fast process never imports cosmos. It sends the recent RGB frames + the
-    instruction, and gets back a future-video numpy array. We convert to a
-    (T, 3, H, W) float tensor on this side so Stage-1 can consume it directly.
-    """
+    """Request CPU plan bundles without importing Cosmos in the fast process."""
 
     def __init__(self, cfg: SlowSystemConfig):
         from multiprocessing.connection import Client  # stdlib
@@ -516,7 +549,7 @@ class RemoteSlowBackend(SlowBackend):
         return self._connected
 
     @torch.no_grad()
-    def generate(self, recent_frames_u8, instruction, seed) -> torch.Tensor:
+    def generate_plan(self, recent_frames_u8, instruction, seed) -> Dict[str, Any]:
         if not self._connected:
             raise RuntimeError("slow RPC not connected")
         # `multiprocessing.connection` is not safe under concurrent send/recv,
@@ -524,27 +557,27 @@ class RemoteSlowBackend(SlowBackend):
         # purely to make any future call site safe.
         with self._lock:
             try:
-                self._conn.send(("generate", list(recent_frames_u8), str(instruction), int(seed)))
+                self._conn.send(("generate_plan", list(recent_frames_u8), str(instruction), int(seed)))
                 resp = self._conn.recv()
             except (EOFError, ConnectionResetError, BrokenPipeError) as exc:
                 LOG.error("[Slow][RPC] connection lost (%s); reconnecting", exc)
                 self._reconnect()
-                self._conn.send(("generate", list(recent_frames_u8), str(instruction), int(seed)))
+                self._conn.send(("generate_plan", list(recent_frames_u8), str(instruction), int(seed)))
                 resp = self._conn.recv()
 
         if not isinstance(resp, dict) or not resp.get("ok"):
             err = resp.get("error") if isinstance(resp, dict) else repr(resp)
             raise RuntimeError(f"slow RPC error: {err}")
-        result = resp["result"]
-        video_np = result["video"]                           # (T, H, W, 3) uint8
-        elapsed = float(result.get("elapsed", 0.0))
-        if video_np.ndim != 4 or video_np.shape[-1] != 3:
-            raise ValueError(f"unexpected slow video shape: {video_np.shape}")
-        # -> (T, 3, H, W) float32 in [0, 1]
-        video = (torch.from_numpy(video_np).float() / 255.0).permute(0, 3, 1, 2).contiguous()
-        LOG.info("[Slow][RPC] received future-video shape=%s elapsed=%.2fs",
-                 tuple(video.shape), elapsed)
-        return video
+        result = dict(resp["result"])
+        tensors = validate_plan_bundle(result)
+        result.update(tensors)
+        LOG.info(
+            "[Slow][RPC] received plan context=%d trajectory_tokens=%d elapsed=%.2fs",
+            int(tensors["context_mask"].sum()),
+            int(tensors["traj_latents"].shape[0]),
+            float(result.get("elapsed", 0.0)),
+        )
+        return result
 
     def close(self) -> None:
         if self._conn is not None:
@@ -601,7 +634,7 @@ class RemoteSlowBackend(SlowBackend):
 # Slow replan worker
 # =========================================================================== #
 class SlowReplanWorker(threading.Thread):
-    """Background worker: turns recent obs + instruction into a fresh z_g.
+    """Background worker: turns recent RGB + instruction into a plan bundle.
 
     Only ever holds a single pending request — older requests are dropped when
     a newer one arrives (so the slow system never falls behind).
@@ -611,23 +644,13 @@ class SlowReplanWorker(threading.Thread):
         self,
         *,
         slow: SlowBackend,
-        stage1: torch.nn.Module,
-        shared_latent: SharedLatentState,
-        device: torch.device,
-        use_amp: bool,
-        goal_image_size: int,
-        route_window: int,
+        shared_plan: PlanBundleState,
         instruction_holder: "_InstructionHolder",
         seed: int,
     ):
         super().__init__(daemon=True, name="SlowReplanWorker")
         self._slow = slow
-        self._stage1 = stage1
-        self._shared = shared_latent
-        self._device = device
-        self._use_amp = use_amp
-        self._goal_size = int(goal_image_size)
-        self._route_window = int(route_window)
+        self._shared = shared_plan
         self._instruction_holder = instruction_holder
         self._seed = int(seed)
 
@@ -696,6 +719,10 @@ class SlowReplanWorker(threading.Thread):
                 self._process(*req)
             except Exception as exc:  # noqa: BLE001
                 LOG.error("[SlowWorker] replan failed: %s\n%s", exc, traceback.format_exc())
+                # A failed or invalid RPC result must not leave a stale plan
+                # looking current; the fast loop immediately takes its
+                # zero-plan, input_goal_mask=1 RGB-D-only path.
+                self._shared.clear()
             finally:
                 self._is_busy.clear()
         LOG.info("[SlowWorker] thread stopped")
@@ -707,62 +734,30 @@ class SlowReplanWorker(threading.Thread):
                  step_id, len(frames), instruction[:120])
         t0 = time.time()
 
-        future_video = self._slow.generate(frames, instruction, seed=self._seed)
+        plan = self._slow.generate_plan(frames, instruction, seed=self._seed)
         slow_secs = time.time() - t0
-        LOG.info("[SlowWorker] slow_inference done step=%d shape=%s elapsed=%.2fs",
-                 step_id, tuple(future_video.shape), slow_secs)
-
-        # Keep a CPU uint8 copy for the debug visualiser before we move to GPU.
-        try:
-            slow_video_u8 = (future_video.detach().clamp(0, 1) * 255.0
-                             ).to(torch.uint8).permute(0, 2, 3, 1).contiguous().cpu().numpy()
-        except Exception:  # noqa: BLE001
-            slow_video_u8 = None
-
-        # Stage-1 wants [B, route_window, 3, H, W] at goal_image_size.
-        future_video = future_video.to(self._device).float()
-        if future_video.ndim != 4:
-            raise ValueError(f"future_video must be (T, 3, H, W); got {tuple(future_video.shape)}")
-        T = future_video.shape[0]
-        # Sample `route_window` frames evenly across the predicted future video.
-        idx = torch.linspace(0, T - 1, steps=self._route_window).round().long().clamp(0, T - 1)
-        sampled = future_video.index_select(0, idx.to(future_video.device))
-        # Resize each frame to (goal_size, goal_size).
-        sampled = torch.nn.functional.interpolate(
-            sampled, size=(self._goal_size, self._goal_size),
-            mode="bilinear", align_corners=False,
+        # A depth-one queue can receive a fresher request while RPC is running.
+        # Never publish the now-stale result in that case.
+        with self._lock:
+            newer_step = self._pending[0] if self._pending is not None else None
+        if newer_step is not None and newer_step > step_id:
+            LOG.info("[SlowWorker] discard stale result step=%d; pending step=%d", step_id, newer_step)
+            return
+        plan["instruction"] = instruction
+        plan["metadata"] = {
+            **dict(plan.get("metadata", {})),
+            "source_step": int(step_id),
+            "source_timestamp": float(t0),
+        }
+        version = self._shared.update(plan, source_step=step_id)
+        LOG.info(
+            "[SlowWorker] published step=%d version=%d context=%d trajectory_tokens=%d slow_time=%.2fs",
+            step_id,
+            version,
+            int(plan["context_mask"].sum()),
+            int(plan["traj_latents"].shape[0]),
+            slow_secs,
         )
-        goal_batch = sampled.unsqueeze(0)  # (1, route_window, 3, H, W)
-        LOG.info("[SlowWorker] stage1 input shape=%s", tuple(goal_batch.shape))
-
-        t1 = time.time()
-        with make_autocast(self._device, self._use_amp):
-            stage1_out = self._stage1(goal_batch, sample=False)
-        z_g = stage1_out["z_g"].detach().float().squeeze(0)  # (z_dim,)
-        # Decode artefacts for visualisation (single batch element).
-        try:
-            goal_xy = stage1_out["goal_pred"].detach().float().cpu().numpy()[0]
-        except Exception:  # noqa: BLE001
-            goal_xy = None
-        try:
-            anchors_xy = stage1_out["anchor_pred"].detach().float().cpu().numpy()[0]
-        except Exception:  # noqa: BLE001
-            anchors_xy = None
-        try:
-            turn_probs = torch.softmax(
-                stage1_out["turn_logits"].detach().float(), dim=-1
-            ).cpu().numpy()[0]
-        except Exception:  # noqa: BLE001
-            turn_probs = None
-
-        stage1_secs = time.time() - t1
-        version = self._shared.update(
-            z_g, source_step=step_id,
-            goal_xy=goal_xy, anchors_xy=anchors_xy,
-            turn_probs=turn_probs, slow_video_u8=slow_video_u8,
-        )
-        LOG.info("[SlowWorker] stage1 done step=%d z_g.shape=%s version=%d stage1_time=%.2fs total=%.2fs",
-                 step_id, tuple(z_g.shape), version, stage1_secs, time.time() - t0)
 
 
 class _InstructionHolder:
@@ -790,12 +785,16 @@ class DebugSnapshot:
 
     step_id: int
     obs_rgb_u8: np.ndarray                       # (H, W, 3) raw observation
-    trajectory_m: np.ndarray                     # (H, 2) Stage-2 prediction
+    trajectory_m: np.ndarray                     # (H, 2) Stage-2 xy prediction
     action: Optional[str]
     z_version: int
-    goal_xy: Optional[np.ndarray] = None         # (2,) coarse goal in meters
-    anchors_xy: Optional[np.ndarray] = None      # (K, 2) anchor waypoints
-    turn_probs: Optional[np.ndarray] = None      # (3,) turn-prob for the latest z_g
+    context_length: int = 0
+    plan_age: float = 0.0
+    slow_latency: float = 0.0
+    fast_latency: float = 0.0
+    goal_xy: Optional[np.ndarray] = None         # final Reason1 waypoint
+    anchors_xy: Optional[np.ndarray] = None      # all Reason1 waypoints
+    turn_probs: Optional[np.ndarray] = None      # deprecated
     slow_video_u8: Optional[np.ndarray] = None   # (T, H, W, 3) — only set on a fresh replan
 
 
@@ -902,7 +901,7 @@ class DebugVisualizer(threading.Thread):
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-        traj = snap.trajectory_m
+        traj = snap.trajectory_m[:, :2]
         # Rolling extent — keep the camera tight on whatever we're plotting now.
         candidates = [np.abs(traj).max() if traj.size else 0.0]
         if snap.anchors_xy is not None and snap.anchors_xy.size:
@@ -933,7 +932,11 @@ class DebugVisualizer(threading.Thread):
         ax.set_xlabel("y (left, m)")
         ax.set_ylabel("x (forward, m)")
         ax.legend(loc="upper left", fontsize=7)
-        title = f"step {snap.step_id}  z_v{snap.z_version}  -> {snap.action or '·'}"
+        title = (
+            f"step {snap.step_id} plan_v{snap.z_version} L={snap.context_length} "
+            f"age={snap.plan_age:.1f}s slow={snap.slow_latency:.2f}s "
+            f"fast={snap.fast_latency:.3f}s -> {snap.action or '·'}"
+        )
         if snap.turn_probs is not None:
             title += f"   turn=[{snap.turn_probs[0]:.2f},{snap.turn_probs[1]:.2f},{snap.turn_probs[2]:.2f}]"
         ax.set_title(title, fontsize=9)
@@ -961,19 +964,7 @@ class DebugVisualizer(threading.Thread):
         side_px = int(self._side_px)
         bev = self._render_bev(snap, side_px=side_px)
 
-        # Refresh the cached slow panel whenever a new replan landed; otherwise
-        # reuse the last one so frame width stays constant for the mp4 writer.
-        if snap.slow_video_u8 is not None and snap.slow_video_u8.size:
-            mid = snap.slow_video_u8.shape[0] // 2
-            self._last_slow_panel = self._resize_to_h(snap.slow_video_u8[mid], side_px)
-        if self._last_slow_panel is None:
-            slow_panel = np.zeros((side_px, side_px, 3), dtype=np.uint8)
-        else:
-            slow_panel = self._resize_to_h(self._last_slow_panel, side_px)
-
-        panels = [self._resize_to_h(obs, side_px),
-                  self._resize_to_h(bev, side_px),
-                  slow_panel]
+        panels = [self._resize_to_h(obs, side_px), self._resize_to_h(bev, side_px)]
         frame = np.concatenate(panels, axis=1)
         if frame.shape[0] % 2 or frame.shape[1] % 2:
             frame = np.pad(frame, ((0, frame.shape[0] % 2),
@@ -1010,6 +1001,38 @@ class DebugVisualizer(threading.Thread):
 # =========================================================================== #
 # Fast policy runner
 # =========================================================================== #
+def load_plan_policy(
+    checkpoint_path: Path,
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.nn.Module, torch.nn.Module]:
+    """Load a v2 token-plan checkpoint; legacy policy checkpoints are rejected."""
+    try:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Plan policy checkpoint must be a mapping.")
+    schema = checkpoint.get("plan_schema_version")
+    if schema != PLAN_SCHEMA_VERSION:
+        raise ValueError(
+            f"Checkpoint schema {schema!r} is incompatible; expected {PLAN_SCHEMA_VERSION!r}. "
+            "Legacy Stage-1/Stage-2 checkpoints cannot be loaded."
+        )
+    if "model" not in checkpoint or "plan_encoder" not in checkpoint:
+        raise KeyError("Plan policy checkpoint requires both 'model' and 'plan_encoder' state dictionaries.")
+    stage2 = build_fast_nav_model(cfg.get("model", {}))
+    plan_encoder = build_plan_encoder(cfg.get("plan_encoder", {}))
+    stage2.load_state_dict(checkpoint["model"], strict=True)
+    plan_encoder.load_state_dict(checkpoint["plan_encoder"], strict=True)
+    stage2.to(device).eval()
+    plan_encoder.to(device).eval()
+    for module in (stage2, plan_encoder):
+        for parameter in module.parameters():
+            parameter.requires_grad = False
+    return stage2, plan_encoder
+
+
 class FastPolicyRunner:
     """Stage-2 policy: builds an obs context from the ring buffer and predicts a trajectory.
 
@@ -1022,46 +1045,41 @@ class FastPolicyRunner:
         self,
         *,
         stage2: torch.nn.Module,
+        plan_encoder: torch.nn.Module,
         cfg_fast: FastSystemConfig,
         stage2_yaml_cfg: Dict[str, Any],
         device: torch.device,
         use_amp: bool,
     ):
         self.stage2 = stage2
+        self.plan_encoder = plan_encoder
         self.cfg = cfg_fast
         self.device = device
         self.use_amp = use_amp
 
-        data_cfg = stage2_yaml_cfg.get("scand_data", {})
+        data_cfg = stage2_yaml_cfg.get("intern_data", stage2_yaml_cfg.get("scand_data", {}))
         self.obs_image_size: int = int(data_cfg.get("obs_image_size", 256))
         self.context_size: int = int(
             data_cfg.get("context_size", stage2_yaml_cfg.get("model", {}).get("context_size", 3))
         )
-        self.context_dt_frames: int = int(data_cfg.get("context_dt_frames", 1))
+        self.context_dt_frames: int = int(data_cfg.get("obs_context_dt_frames", 1))
         self.action_horizon: int = int(data_cfg.get("action_horizon", 16))
-        self.action_dim: int = int(stage2_yaml_cfg.get("model", {}).get("action_dim", 2))
+        self.action_dim: int = int(stage2_yaml_cfg.get("model", {}).get("action_dim", 3))
         self.waypoint_spacing: float = float(data_cfg.get("metric_waypoint_spacing", 0.38))
         self.normalize_actions: bool = bool(data_cfg.get("normalize_actions", True))
         self.pred_to_meter: float = self.waypoint_spacing if self.normalize_actions else 1.0
         self.action_stats = action_stats_from_cfg(stage2_yaml_cfg)
 
-        # Inferred from Stage-2 ckpt (z_dim).
-        self.z_dim: int = int(stage2_yaml_cfg.get("model", {}).get("z_dim", 128))
-        self.zero_z_g = torch.zeros(self.z_dim, device=self.device)
+        self.plan_dim: int = int(stage2_yaml_cfg.get("model", {}).get("plan_dim", 384))
+        self.num_plan_tokens: int = int(getattr(plan_encoder, "num_plan_tokens", 19))
+        self.zero_plan = torch.zeros(self.num_plan_tokens, self.plan_dim, device=self.device)
+        self.last_latency = 0.0
 
-    @property
-    def goal_image_size(self) -> int:
-        # Stage-1 takes goal_image_size frames; mirror demo.py default.
-        # We deliberately keep this the same as obs to avoid a second resize path.
-        return self.obs_image_size
-
-    def _build_obs_context_chw(self, recent: List[StoredFrame]) -> torch.Tensor:
-        """Build a (1, context+1, 3, H, W) Stage-2 obs tensor from recent frames."""
+    def _build_obs_context_chw(self, recent: List[StoredFrame]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build RGB context and the latest aligned metric-depth tensor."""
         size = (self.obs_image_size, self.obs_image_size)
         if not recent:
-            blank = to_chw_float(np.zeros((size[1], size[0], 3), dtype=np.uint8), size)
-            stack = blank.unsqueeze(0).expand(self.context_size + 1, -1, -1, -1).clone()
-            return stack.unsqueeze(0).to(self.device)
+            raise ValueError("FastNav requires at least one RGB-D observation.")
 
         # Walk back at training temporal spacing; clamp to oldest frame.
         chw_cache: Dict[int, torch.Tensor] = {}
@@ -1076,31 +1094,43 @@ class FastPolicyRunner:
             if j not in chw_cache:
                 chw_cache[j] = to_chw_float(recent[j].rgb, size)
         stack = torch.stack([chw_cache[j] for j in idx_seq], dim=0)
-        return stack.unsqueeze(0).to(self.device)
+        depth = to_depth_float(recent[-1].depth_m, size)
+        return stack.unsqueeze(0).to(self.device), depth.unsqueeze(0).to(self.device)
 
     @torch.no_grad()
     def predict_trajectory(
         self,
         recent: List[StoredFrame],
-        z_g: Optional[torch.Tensor],
+        plan: Optional[PlanBundleInfo],
         *,
         step_id: int,
         latent_version: int,
     ) -> np.ndarray:
-        """Returns trajectory of shape (H, 2) in meters (x forward, y left)."""
-        obs_batch = self._build_obs_context_chw(recent)
-        if z_g is None:
-            z_used = self.zero_z_g.unsqueeze(0)
-            mask = torch.ones(1, device=self.device, dtype=torch.long)
-            mode = "no-zg (input_goal_mask=1)"
-        else:
-            z_used = z_g.detach().to(self.device).unsqueeze(0)
-            mask = None
-            mode = f"z_g v{latent_version}"
-
+        """Return ``(x meters, y meters, yaw radians)`` with shape ``[H,3]``."""
         t0 = time.time()
+        obs_batch, depth_batch = self._build_obs_context_chw(recent)
+        if plan is None:
+            z_used = self.zero_plan.unsqueeze(0)
+            mask = torch.ones(1, device=self.device, dtype=torch.long)
+            mode = "obs-only (input_goal_mask=1)"
+        else:
+            plan_offset = max(1, min(12, int(step_id) - int(plan.source_step)))
+            with make_autocast(self.device, self.use_amp):
+                z_used = self.plan_encoder(
+                    plan.reason_context.unsqueeze(0),
+                    plan.context_mask.unsqueeze(0),
+                    plan.traj_latents.unsqueeze(0),
+                    torch.tensor([plan_offset], device=self.device),
+                )
+            mask = None
+            mode = (
+                f"plan v{latent_version} offset={plan_offset} "
+                f"age={max(0.0, time.time() - plan.timestamp):.2f}s"
+            )
+
         traj = sample_traj(
             self.stage2, obs_batch, z_used,
+            depth=depth_batch,
             horizon=self.action_horizon,
             action_dim=self.action_dim,
             steps=self.cfg.cfm_steps,
@@ -1110,8 +1140,10 @@ class FastPolicyRunner:
             device=self.device,
             amp=self.use_amp,
         )
-        traj_m = (traj * self.pred_to_meter).detach().cpu().numpy()[0]  # (H, 2)
+        traj_m = traj.detach().cpu().numpy()[0]
+        traj_m[:, :2] *= self.pred_to_meter
         elapsed = time.time() - t0
+        self.last_latency = elapsed
         preview = traj_m[: min(3, traj_m.shape[0])]
         LOG.info("[FastLoop] step=%d mode=%s obs=%s traj=%s preview=%s fast_time=%.3fs",
                  step_id, mode, tuple(obs_batch.shape), tuple(traj_m.shape),
@@ -1136,8 +1168,7 @@ class HavanaPolicyServer:
         LOG.info("Havana Policy Server starting up")
         LOG.info("  device         : %s (amp=%s)", self._device, self._use_amp)
         LOG.info("  fast.config    : %s", cfg.fast.config_path)
-        LOG.info("  fast.stage1    : %s", cfg.fast.stage1_ckpt)
-        LOG.info("  fast.stage2    : %s", cfg.fast.stage2_ckpt)
+        LOG.info("  fast.checkpoint: %s", cfg.fast.checkpoint)
         LOG.info("  slow.enabled   : %s", cfg.slow.enabled)
         if cfg.slow.enabled:
             LOG.info("  slow.remote    : %s", cfg.slow.remote_address)
@@ -1148,14 +1179,16 @@ class HavanaPolicyServer:
         # ----- Fast system load --------------------------------------------- #
         t_fast = time.time()
         stage2_cfg = load_stage2_config(Path(cfg.fast.config_path))
-        self._stage1 = load_stage1(Path(cfg.fast.stage1_ckpt), self._device)
-        self._stage2 = load_stage2(Path(cfg.fast.stage2_ckpt), stage2_cfg, self._device).to(self._device)
+        self._stage2, self._plan_encoder = load_plan_policy(
+            Path(cfg.fast.checkpoint), stage2_cfg, self._device
+        )
         self._stage2_cfg = stage2_cfg
         LOG.info("[Init] fast system loaded in %.2fs", time.time() - t_fast)
 
         # ----- Fast runner -------------------------------------------------- #
         self._fast_runner = FastPolicyRunner(
             stage2=self._stage2,
+            plan_encoder=self._plan_encoder,
             cfg_fast=cfg.fast,
             stage2_yaml_cfg=stage2_cfg,
             device=self._device,
@@ -1164,7 +1197,7 @@ class HavanaPolicyServer:
 
         # ----- Observation buffer / shared state --------------------------- #
         self._obs_buf = ObservationRingBuffer(cfg.obs_history_len)
-        self._shared_zg = SharedLatentState()
+        self._shared_plan = PlanBundleState()
         self._instruction = _InstructionHolder(cfg.instruction)
 
         # ----- Slow backend ------------------------------------------------- #
@@ -1178,27 +1211,16 @@ class HavanaPolicyServer:
                           "falling back to stub. Set slow_system.enabled=false to silence.",
                           exc)
                 LOG.debug(traceback.format_exc())
-                slow_backend = StubSlowBackend(
-                    num_frames=cfg.slow.num_output_frames,
-                    image_size=self._fast_runner.goal_image_size,
-                )
+                slow_backend = StubSlowBackend()
         else:
             LOG.info("[Init] slow backend disabled — using stub (zero z_g via masked path)")
-            slow_backend = StubSlowBackend(
-                num_frames=cfg.slow.num_output_frames,
-                image_size=self._fast_runner.goal_image_size,
-            )
+            slow_backend = StubSlowBackend()
         self._slow_backend = slow_backend
 
         # ----- Slow worker (started in start()) ----------------------------- #
         self._slow_worker = SlowReplanWorker(
             slow=self._slow_backend,
-            stage1=self._stage1,
-            shared_latent=self._shared_zg,
-            device=self._device,
-            use_amp=self._use_amp,
-            goal_image_size=self._fast_runner.goal_image_size,
-            route_window=cfg.route_window,
+            shared_plan=self._shared_plan,
             instruction_holder=self._instruction,
             seed=cfg.seed,
         )
@@ -1212,10 +1234,10 @@ class HavanaPolicyServer:
         self._adapter: Optional[TrajectoryActionAdapter] = None
         self._step_count = 0
         self._started = False
-        # Tracks when the *first* z_g has been published. Until then we always
+        # Tracks when the first plan has been published. Until then we always
         # try to trigger a replan; after that we only replan on the configured
         # interval (so we know the scene has had time to actually change).
-        self._first_zg_seen = False
+        self._first_plan_seen = False
         self._last_visualised_version = 0
 
         LOG.info("Policy server is ready (slow_real=%s, fast_amp=%s)",
@@ -1237,10 +1259,10 @@ class HavanaPolicyServer:
             timeout = max(30.0, float(self.cfg.slow.connect_timeout) * 2.0)
             self._slow_worker.discard_pending_and_wait(timeout=timeout)
         self._obs_buf.clear()
-        self._shared_zg.clear()
+        self._shared_plan.clear()
         self._instruction.set(str(instruction))
         self._step_count = 0
-        self._first_zg_seen = False
+        self._first_plan_seen = False
         self._last_visualised_version = 0
         LOG.info("[Server] episode reset; instruction='%s'", instruction)
 
@@ -1282,40 +1304,35 @@ class HavanaPolicyServer:
         """Push obs into the ring buffer and possibly trigger the slow worker."""
         rgb = obs.get("rgb_sensor", obs.get("rgb"))
         if rgb is None:
-            LOG.warning("[Server] obs has no rgb_sensor/rgb key (keys=%s)", list(obs.keys()))
-            return
-        rgb_u8 = _strip_alpha_to_rgb_u8(rgb)
+            raise KeyError(f"Observation has no rgb_sensor/rgb key; keys={list(obs.keys())}.")
         depth = obs.get("depth_sensor", obs.get("depth"))
-        depth_arr = None
-        if isinstance(depth, np.ndarray):
-            d = depth
-            if d.ndim == 3 and d.shape[-1] == 1:
-                d = d[..., 0]
-            depth_arr = d.astype(np.float32)
-
-        frame = StoredFrame(step_id=step_id, rgb=rgb_u8, depth=depth_arr, timestamp=time.time())
+        if depth is None:
+            raise KeyError(
+                f"FastNav RGB-D policy requires depth_sensor/depth; keys={list(obs.keys())}."
+            )
+        rgb_u8 = _strip_alpha_to_rgb_u8(rgb)
+        depth_m = _coerce_depth_m(depth)
+        frame = StoredFrame(step_id=step_id, rgb=rgb_u8, depth_m=depth_m, timestamp=time.time())
         self._obs_buf.push(frame)
 
         if step_id % 50 == 0:
             LOG.info("[Server] step=%d obs_keys=%s rgb_shape=%s depth_shape=%s buffer_len=%d",
-                     step_id, list(obs.keys()), rgb_u8.shape,
-                     depth_arr.shape if depth_arr is not None else None,
-                     len(self._obs_buf))
+                     step_id, list(obs.keys()), rgb_u8.shape, depth_m.shape, len(self._obs_buf))
 
         # Decide whether to wake the slow worker:
-        #   - Until the very first z_g lands, hammer it as soon as we have
-        #     enough history (no use waiting `slow_replan_interval` ticks if
-        #     we don't even have a z_g yet — Stage-2 has nothing real to use).
-        #   - After the first z_g, only replan on the configured cadence so
+        #   - Until the first plan lands, submit as soon as enough RGB history
+        #     is available and the worker is idle.
+        #   - After the first plan, only replan on the configured cadence so
         #     that consecutive replans see meaningfully different scenes.
         have_history = len(self._obs_buf) >= max(1, int(self.cfg.slow_min_obs))
         interval = max(1, int(self.cfg.slow_replan_interval))
-        if not self._first_zg_seen:
-            self._first_zg_seen = self._shared_zg.get() is not None
-        if have_history and (
-            not self._first_zg_seen or step_id % interval == 0
-        ):
-            recent_frames_u8 = [f.rgb for f in self._obs_buf.latest_n(self.cfg.slow_video_frames)]
+        self._first_plan_seen = self._shared_plan.get() is not None
+        should_request = (
+            (not self._first_plan_seen and not self._slow_worker.busy)
+            or (self._first_plan_seen and step_id % interval == 0)
+        )
+        if self._slow_backend.is_real() and have_history and should_request:
+            recent_frames_u8 = [f.rgb for f in self._obs_buf.latest_n(self.cfg.slow_input_frames)]
             self._slow_worker.request_replan(step_id, recent_frames_u8)
 
     # ------------------------------------------------------------- action #
@@ -1342,32 +1359,15 @@ class HavanaPolicyServer:
             LOG.warning("[FastLoop] step=%d obs buffer empty -> safe fallback (no-op)", step_id)
             return None
 
-        latent = self._shared_zg.get()
-        slow_real = self._slow_backend.is_real()
-
-        if latent is None and slow_real:
-            # Real slow system is still warming up — emit a no-op (None) so the
-            # caller can simply repeat next tick without ending the episode.
+        plan = self._shared_plan.get()
+        if plan is None:
             busy = "busy" if self._slow_worker.busy else "idle"
-            LOG.info("[FastLoop] step=%d z_g is not ready yet (slow worker %s) "
-                     "-> safe fallback (no-op)", step_id, busy)
-            return None
-
-        # Pick the conditioning path:
-        #   - real slow + valid z_g -> use it
-        #   - stub slow OR latent is None -> always run masked (no-zg) trajectory
-        #     so we can still drive the closed loop without trusting a stubbed
-        #     latent.
-        if slow_real and latent is not None:
-            z_arg = latent.z_g
-            version_arg = latent.version
-        else:
-            z_arg = None
-            version_arg = 0
+            LOG.info("[FastLoop] step=%d plan unavailable (slow worker %s); using RGB-D-only fallback", step_id, busy)
+        version_arg = plan.version if plan is not None else 0
 
         try:
             traj_m = self._fast_runner.predict_trajectory(
-                recent, z_g=z_arg, step_id=step_id, latent_version=version_arg,
+                recent, plan=plan, step_id=step_id, latent_version=version_arg,
             )
         except Exception as exc:
             LOG.error("[FastLoop] inference failed: %s\n%s", exc, traceback.format_exc())
@@ -1379,7 +1379,7 @@ class HavanaPolicyServer:
             LOG.error("[Adapter] conversion failed: %s\n%s", exc, traceback.format_exc())
             return None
 
-        self._maybe_publish_debug(recent[-1], traj_m, action, latent, step_id)
+        self._maybe_publish_debug(recent[-1], traj_m, action, plan, step_id)
 
         sleep_s = float(getattr(self.cfg, "fast_sleep_time", 0.0))
         if sleep_s > 0.0:
@@ -1391,29 +1391,24 @@ class HavanaPolicyServer:
         last_frame: StoredFrame,
         traj_m: np.ndarray,
         action: Optional[str],
-        latent: Optional[LatentInfo],
+        latent: Optional[PlanBundleInfo],
         step_id: int,
     ) -> None:
         if self._visualizer is None:
             return
-        # Only attach the slow video to the snapshot the *first* time we see a
-        # given z_g version — otherwise the debug mp4 / per-replan dump would
-        # repeat the same future video on every fast tick.
-        slow_video = None
-        if latent is not None and latent.slow_video_u8 is not None:
-            if latent.version != self._last_visualised_version:
-                slow_video = latent.slow_video_u8
-                self._last_visualised_version = latent.version
         snap = DebugSnapshot(
             step_id=step_id,
             obs_rgb_u8=last_frame.rgb,
-            trajectory_m=np.asarray(traj_m, dtype=np.float32),
+            trajectory_m=np.asarray(traj_m[:, :2], dtype=np.float32),
             action=action,
             z_version=latent.version if latent is not None else 0,
-            goal_xy=latent.goal_xy if latent is not None else None,
-            anchors_xy=latent.anchors_xy if latent is not None else None,
-            turn_probs=latent.turn_probs if latent is not None else None,
-            slow_video_u8=slow_video,
+            context_length=int(latent.context_mask.sum()) if latent is not None else 0,
+            plan_age=max(0.0, time.time() - latent.timestamp) if latent is not None else 0.0,
+            slow_latency=latent.elapsed if latent is not None else 0.0,
+            fast_latency=self._fast_runner.last_latency,
+            goal_xy=None,
+            anchors_xy=None,
+            slow_video_u8=None,
         )
         self._visualizer.submit(snap)
 
@@ -1576,7 +1571,7 @@ def _smoke_loop(server: HavanaPolicyServer, num_steps: int) -> None:
     for sid in range(num_steps):
         obs = {
             "rgb_sensor": rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8),
-            "depth_sensor": rng.random((480, 640), dtype=np.float32) * 5.0,
+            "depth_sensor": rng.uniform(0.1, 5.0, size=(480, 640)).astype(np.float32),
         }
         action = server.get_action(obs, sid)
         LOG.info("[SmokeTest] step=%d -> action=%s", sid, action)

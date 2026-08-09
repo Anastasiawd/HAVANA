@@ -2,10 +2,10 @@ seed: 5
 device: cuda
 
 stage1:
-  checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/stage1.pt
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/model_weights/stage1.pt
 
 flownav:
-  checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/flownav.pth
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/model_weights/flownav.pth
 
 model:
   encoding_size: 256
@@ -26,7 +26,7 @@ model:
     dropout: 0.0
     lingbot_depth:
       enabled: true
-      checkpoint: /home/wangdzh/ffnav/havana/fast_system/model_weights/lingbot-depth-pretrain-vitl-14-v0p5.pt
+      checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/model_weights/lingbot-depth-pretrain-vitl-14-v0p5.pt
       resolution_level: 5
       num_tokens: null
       default_depth: 0.0
@@ -40,8 +40,8 @@ model:
     cond_predict_scale: false
 
 scand_data:
-  train_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_train_index.jsonl
-  val_index: /home/wangdzh/ffnav/havana/fast_system/data_preparation/mix_stage1_val_index.jsonl
+  train_index: /home/csevolunt/dongzhih/HAVANA/fast_system/data_preparation/mix_stage1_train_index.jsonl
+  val_index: /home/csevolunt/dongzhih/HAVANA/fast_system/data_preparation/mix_stage1_val_index.jsonl
   obs_image_size: 256
   goal_image_size: 256
   action_horizon: 16
@@ -66,7 +66,7 @@ dataloader:
   timeout: 120
 
 training:
-  output_dir: /home/wangdzh/ffnav/havana/fast_system/checkpoints/stage2
+  output_dir: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/stage2
   epochs: 50
   lr: 0.0001
   weight_decay: 0.05
