@@ -104,9 +104,9 @@ class FrozenReason1Planner:
         reason_video: torch.Tensor,
         instructions: Sequence[str],
     ) -> tuple[dict[str, torch.Tensor], float]:
-        if reason_video.ndim != 5 or tuple(reason_video.shape[1:3]) != (3, 17):
+        if reason_video.ndim != 5 or tuple(reason_video.shape[1:3]) != (3, 5):
             raise ValueError(
-                "reason_video must have native temporal shape [B,3,17,H,W], "
+                "reason_video must contain the five Reason1 condition frames [B,3,5,H,W], "
                 f"got {tuple(reason_video.shape)}."
             )
         if tuple(reason_video.shape[-2:]) != (272, 480):
@@ -117,8 +117,8 @@ class FrozenReason1Planner:
         if len(instructions) != batch_size:
             raise ValueError(f"Expected {batch_size} instructions, got {len(instructions)}.")
 
-        # TrajectoryReason1Encoder converts the five condition frames to PIL,
-        # so keep the native video on CPU and avoid a pointless GPU round-trip.
+        # TrajectoryReason1Encoder converts these five condition frames to PIL,
+        # so keep the video on CPU and avoid a pointless GPU round-trip.
         video = reason_video.detach().to(device="cpu", dtype=torch.uint8).contiguous()
         data_batch = {
             "dataset_name": "video_data",

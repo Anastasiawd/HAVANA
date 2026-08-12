@@ -121,10 +121,33 @@ class FastSystemConfig:
     """Runtime knobs for the jointly-trained PlanEncoder + Stage-2 policy."""
 
     config_path: str = str(FAST_SYSTEM_ROOT / "configs" / "plan_stage2.yaml")
-    checkpoint: str = str(FAST_SYSTEM_ROOT / "checkpoints" / "plan_stage2" / "last.pt")
-    cfm_steps: int = 5
+    checkpoint: str = str(
+        FAST_SYSTEM_ROOT / "checkpoints" / "plan_stage2_single_rgbd_time_strat3" / "last.pt"
+    )
+    cfm_steps: int = 8
     num_trajectory_samples: int = 1
     use_amp: bool = True
+    # One step_id increment represents one incoming simulator observation.
+    # This converts plan age from observation ticks to seconds.
+    observation_fps: float = 30.0
+
+
+def plan_time_seconds_from_steps(
+    step_id: int,
+    source_step: int,
+    observation_fps: float,
+    plan_horizon_seconds: float,
+) -> float:
+    """Convert simulator observation ticks to bounded plan-relative seconds."""
+
+    observation_fps = float(observation_fps)
+    plan_horizon_seconds = float(plan_horizon_seconds)
+    if not math.isfinite(observation_fps) or observation_fps <= 0:
+        raise ValueError("observation_fps must be positive.")
+    if not math.isfinite(plan_horizon_seconds) or plan_horizon_seconds <= 0:
+        raise ValueError("plan_horizon_seconds must be positive.")
+    elapsed_steps = max(0, int(step_id) - int(source_step))
+    return min(plan_horizon_seconds, float(elapsed_steps) / observation_fps)
 
 
 @dataclass
@@ -1060,7 +1083,7 @@ class FastPolicyRunner:
         data_cfg = stage2_yaml_cfg.get("intern_data", stage2_yaml_cfg.get("scand_data", {}))
         self.obs_image_size: int = int(data_cfg.get("obs_image_size", 256))
         self.context_size: int = int(
-            data_cfg.get("context_size", stage2_yaml_cfg.get("model", {}).get("context_size", 3))
+            data_cfg.get("context_size", stage2_yaml_cfg.get("model", {}).get("context_size", 0))
         )
         self.context_dt_frames: int = int(data_cfg.get("obs_context_dt_frames", 1))
         self.action_horizon: int = int(data_cfg.get("action_horizon", 16))
@@ -1069,6 +1092,14 @@ class FastPolicyRunner:
         self.normalize_actions: bool = bool(data_cfg.get("normalize_actions", True))
         self.pred_to_meter: float = self.waypoint_spacing if self.normalize_actions else 1.0
         self.action_stats = action_stats_from_cfg(stage2_yaml_cfg)
+        self.observation_fps = float(cfg_fast.observation_fps)
+        if not math.isfinite(self.observation_fps) or self.observation_fps <= 0:
+            raise ValueError("fast.observation_fps must be positive.")
+        plan_cfg = stage2_yaml_cfg.get("plan_encoder", {})
+        anchor_times = tuple(float(value) for value in plan_cfg.get("trajectory_anchor_times", (0.4, 0.8, 1.2)))
+        if not anchor_times or any(value <= 0 for value in anchor_times):
+            raise ValueError("plan_encoder.trajectory_anchor_times must contain positive seconds.")
+        self.plan_horizon_seconds = max(anchor_times)
 
         self.plan_dim: int = int(stage2_yaml_cfg.get("model", {}).get("plan_dim", 384))
         self.num_plan_tokens: int = int(getattr(plan_encoder, "num_plan_tokens", 19))
@@ -1114,17 +1145,22 @@ class FastPolicyRunner:
             mask = torch.ones(1, device=self.device, dtype=torch.long)
             mode = "obs-only (input_goal_mask=1)"
         else:
-            plan_offset = max(1, min(12, int(step_id) - int(plan.source_step)))
+            plan_time_seconds = plan_time_seconds_from_steps(
+                step_id,
+                plan.source_step,
+                self.observation_fps,
+                self.plan_horizon_seconds,
+            )
             with make_autocast(self.device, self.use_amp):
                 z_used = self.plan_encoder(
                     plan.reason_context.unsqueeze(0),
                     plan.context_mask.unsqueeze(0),
                     plan.traj_latents.unsqueeze(0),
-                    torch.tensor([plan_offset], device=self.device),
+                    torch.tensor([plan_time_seconds], device=self.device),
                 )
             mask = None
             mode = (
-                f"plan v{latent_version} offset={plan_offset} "
+                f"plan v{latent_version} plan_time={plan_time_seconds:.3f}s "
                 f"age={max(0.0, time.time() - plan.timestamp):.2f}s"
             )
 

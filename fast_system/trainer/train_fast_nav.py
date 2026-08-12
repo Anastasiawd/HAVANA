@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import sys
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
@@ -26,6 +28,7 @@ if str(HAVANA_ROOT) not in sys.path:
     sys.path.insert(0, str(HAVANA_ROOT))
 
 from fast_system.dataset.intern_plan_dataset import (  # noqa: E402
+    ResumableEpochSampler,
     build_intern_online_dataloader,
     build_intern_plan_dataloader,
 )
@@ -203,6 +206,123 @@ def build_constant_with_warmup_scheduler(
         return min(float(step + 1) / float(warmup_steps), 1.0)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_factor)
+
+
+def capture_rng_state() -> dict[str, Any]:
+    """Capture stochastic training state needed for an exact continuation."""
+
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore RNG state saved immediately after a completed optimizer step."""
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    cuda_states = state.get("cuda")
+    if cuda_states is not None and torch.cuda.is_available():
+        for device_index, cuda_state in enumerate(cuda_states[: torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(cuda_state.cpu(), device=device_index)
+
+
+def configure_loader_epoch(
+    loader,
+    epoch: int,
+    start_index: int = 0,
+    *,
+    permutation_seed: int | None = None,
+    legacy_global_seed: bool = False,
+) -> None:
+    sampler = getattr(loader, "sampler", None)
+    if not isinstance(sampler, ResumableEpochSampler):
+        raise TypeError("FastNav training requires ResumableEpochSampler for checkpointable data order.")
+    sampler.set_epoch(
+        epoch,
+        start_index,
+        permutation_seed=permutation_seed,
+        legacy_global_seed=legacy_global_seed,
+    )
+
+
+def checkpoint_data_state(
+    loader,
+    epoch: int,
+    samples_completed: int,
+    batches_completed: int,
+) -> dict[str, Any]:
+    sampler = getattr(loader, "sampler", None)
+    if not isinstance(sampler, ResumableEpochSampler):
+        raise TypeError("Cannot checkpoint a loader without ResumableEpochSampler.")
+    sampler_state = sampler.state_dict()
+    sampler_state["start_index"] = int(samples_completed)
+    return {
+        "version": 1,
+        "epoch": int(epoch),
+        "samples_completed_in_epoch": int(samples_completed),
+        "batches_completed_in_epoch": int(batches_completed),
+        "dataset_size": int(sampler.dataset_size),
+        "batch_size": int(loader.batch_size),
+        "drop_last": bool(loader.drop_last),
+        "sampler": sampler_state,
+    }
+
+
+def resolve_resume_data_state(checkpoint: Mapping[str, Any], loader) -> tuple[dict[str, Any], bool]:
+    """Resolve a checkpoint cursor, including legacy batch-only checkpoints."""
+
+    dataset_size = len(loader.dataset)
+    epoch = int(checkpoint["epoch"])
+    epoch_complete = bool(checkpoint.get("epoch_complete", True))
+    saved = checkpoint.get("data_state")
+    legacy = not isinstance(saved, Mapping)
+    if legacy:
+        saved_loader = checkpoint.get("config", {}).get("dataloader", {})
+        saved_batch_size = int(saved_loader.get("batch_size", loader.batch_size))
+        saved_batches_completed = int(checkpoint.get("batch_index", 0))
+        samples_completed = min(dataset_size, saved_batches_completed * saved_batch_size)
+        batches_completed = (samples_completed + int(loader.batch_size) - 1) // int(loader.batch_size)
+        permutation_seed = None
+    else:
+        saved_size = int(saved.get("dataset_size", dataset_size))
+        if saved_size != dataset_size:
+            raise ValueError(
+                "Cannot exactly resume DataLoader because the filtered dataset size changed: "
+                f"checkpoint={saved_size}, current={dataset_size}."
+            )
+        samples_completed = int(saved.get("samples_completed_in_epoch", 0))
+        batches_completed = (samples_completed + int(loader.batch_size) - 1) // int(loader.batch_size)
+        sampler_state = saved.get("sampler", {})
+        permutation_seed = (
+            sampler_state.get("permutation_seed")
+            if isinstance(sampler_state, Mapping)
+            else None
+        )
+        if not 0 <= samples_completed <= dataset_size:
+            raise ValueError(
+                f"Invalid checkpoint DataLoader cursor {samples_completed}/{dataset_size}."
+            )
+
+    resume_same_epoch = not epoch_complete and samples_completed < dataset_size
+    if not resume_same_epoch:
+        epoch += 1
+        samples_completed = 0
+        batches_completed = 0
+        permutation_seed = None
+    return {
+        "data_epoch": epoch,
+        "samples_completed_in_epoch": samples_completed,
+        "batches_completed_in_epoch": batches_completed,
+        "sampler_permutation_seed": permutation_seed,
+        "legacy_sampler_seed": legacy and resume_same_epoch,
+    }, legacy
 
 
 def parse_args() -> argparse.Namespace:
@@ -392,7 +512,15 @@ def flatten_async(
         return dict(batch), plan_tokens
     batch_size, offsets = obs.shape[:2]
     flat = dict(batch)
-    for name in ("obs", "depth", "action", "action_mask", "distance", "async_offsets"):
+    for name in (
+        "obs",
+        "depth",
+        "action",
+        "action_mask",
+        "distance",
+        "async_offsets",
+        "plan_times",
+    ):
         value = batch[name]
         flat[name] = value.reshape(batch_size * offsets, *value.shape[2:])
     if plan_tokens.shape[:2] != (batch_size, offsets):
@@ -415,7 +543,7 @@ def compute_loss(
         batch["reason_context"],
         batch["context_mask"],
         batch["traj_latents"],
-        batch["async_offsets"],
+        batch["plan_times"],
     )
     slow_batch_size = int(batch["obs"].shape[0])
     num_offsets = int(batch["obs"].shape[1]) if batch["obs"].ndim == 6 else 1
@@ -471,6 +599,7 @@ def save_checkpoint(
     global_step: int = 0,
     batch_index: int = 0,
     epoch_complete: bool = False,
+    data_state: Mapping[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if ema is None:
@@ -500,6 +629,8 @@ def save_checkpoint(
         "batch_index": int(batch_index),
         "epoch_complete": bool(epoch_complete),
         "global_step": int(global_step),
+        "data_state": dict(data_state) if data_state is not None else None,
+        "rng_state": capture_rng_state(),
         "ema": ema_metadata,
         "config": dict(config),
         "plan_schema_version": PLAN_SCHEMA_VERSION,
@@ -545,6 +676,7 @@ def save_step_checkpoint(
     global_step: int,
     config: Mapping[str, Any],
     epoch_complete: bool = False,
+    data_state: Mapping[str, Any] | None = None,
     name: str | None = None,
 ) -> Path:
     checkpoint_path = output_dir / (name or f"step_{int(global_step):09d}.pt")
@@ -561,6 +693,7 @@ def save_step_checkpoint(
         global_step=global_step,
         batch_index=batch_index,
         epoch_complete=epoch_complete,
+        data_state=data_state,
     )
     update_last_checkpoint(checkpoint_path, output_dir / "last.pt")
     return checkpoint_path
@@ -582,7 +715,7 @@ def run_epoch(
     wandb_run=None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     ema: TrainableEMA | None = None,
-    training_state: dict[str, int] | None = None,
+    training_state: dict[str, Any] | None = None,
     output_dir: Path | None = None,
 ) -> dict[str, float]:
     model.train(train)
@@ -602,7 +735,13 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
     training = config["training"]
     if training_state is None:
-        training_state = {"global_step": 0, "last_saved_step": 0}
+        training_state = {
+            "global_step": 0,
+            "last_saved_step": 0,
+            "data_epoch": epoch,
+            "samples_completed_in_epoch": 0,
+            "batches_completed_in_epoch": 0,
+        }
     save_every_steps = max(0, int(training.get("save_every_steps", 0)))
     split = "train" if train else "val"
     log_every = max(1, int(config.get("wandb", {}).get("log_every", 1)))
@@ -612,14 +751,20 @@ def run_epoch(
         "max": tuple(stats_cfg["max"]),
         "clip": bool(stats_cfg.get("clip", False)),
     }
+    samples_completed = int(training_state.get("samples_completed_in_epoch", 0)) if train else 0
+    loader_batch_size = max(1, int(getattr(loader, "batch_size", 1) or 1))
+    display_initial = samples_completed // loader_batch_size
     progress = tqdm(
         loader,
-        total=len(loader),
+        total=display_initial + len(loader),
+        initial=display_initial,
         desc=f"{split} epoch {epoch}/{total_epochs}",
         dynamic_ncols=True,
         leave=True,
     )
-    for batch_index, batch in enumerate(progress, start=1):
+    for relative_batch_index, batch in enumerate(progress, start=1):
+        source_batch_size = int(batch["obs"].shape[0])
+        batch_index = relative_batch_index
         reason1_latency = 0.0
         if reason1_planner is not None:
             reason_video = batch.pop("reason_video")
@@ -648,6 +793,14 @@ def run_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            training_state["data_epoch"] = int(epoch)
+            training_state["samples_completed_in_epoch"] = int(
+                training_state.get("samples_completed_in_epoch", 0)
+            ) + source_batch_size
+            training_state["batches_completed_in_epoch"] = int(
+                training_state.get("batches_completed_in_epoch", 0)
+            ) + 1
+            batch_index = int(training_state["batches_completed_in_epoch"])
             optimizer_updated = not scaler.is_enabled() or float(scaler.get_scale()) >= scale_before
             if optimizer_updated:
                 if scheduler is not None:
@@ -671,6 +824,12 @@ def run_epoch(
                         batch_index=batch_index,
                         global_step=global_step,
                         config=config,
+                        data_state=checkpoint_data_state(
+                            loader,
+                            epoch,
+                            int(training_state["samples_completed_in_epoch"]),
+                            int(training_state["batches_completed_in_epoch"]),
+                        ),
                     )
                     training_state["last_saved_step"] = global_step
                     print(f"saved checkpoint: {checkpoint_path}", flush=True)
@@ -794,7 +953,16 @@ def main() -> None:
             max_value=float(ema_cfg.get("max_value", 0.9999)),
         )
     start_epoch = 1
-    training_state = {"global_step": 0, "last_saved_step": 0}
+    training_state = {
+        "global_step": 0,
+        "last_saved_step": 0,
+        "data_epoch": 1,
+        "samples_completed_in_epoch": 0,
+        "batches_completed_in_epoch": 0,
+        "sampler_permutation_seed": None,
+        "legacy_sampler_seed": False,
+    }
+    resume_rng_state = None
     if args.resume is not None:
         checkpoint = torch.load(str(args.resume), map_location=device, weights_only=False)
         if checkpoint.get("plan_schema_version") != PLAN_SCHEMA_VERSION:
@@ -825,23 +993,61 @@ def main() -> None:
         if checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
         global_step = int(checkpoint.get("global_step", 0))
-        training_state = {"global_step": global_step, "last_saved_step": global_step}
-        epoch_complete = bool(checkpoint.get("epoch_complete", True))
-        start_epoch = int(checkpoint["epoch"]) + (1 if epoch_complete else 0)
-        if not epoch_complete:
-            print(
-                f"resuming step checkpoint at global_step={global_step}; "
-                f"epoch {start_epoch} restarts from its beginning",
-                flush=True,
-            )
+        data_resume, legacy_data_state = resolve_resume_data_state(checkpoint, train_loader)
+        training_state = {
+            "global_step": global_step,
+            "last_saved_step": global_step,
+            **data_resume,
+        }
+        start_epoch = int(data_resume["data_epoch"])
+        samples_completed = int(data_resume["samples_completed_in_epoch"])
+        current_batch = (
+            samples_completed + int(train_loader.batch_size) - 1
+        ) // int(train_loader.batch_size)
+        total_batches = (
+            len(train_loader.dataset) + int(train_loader.batch_size) - 1
+        ) // int(train_loader.batch_size)
+        legacy_note = (
+            " Legacy checkpoint has no saved sampler/RNG state; its sample cursor was "
+            "reconstructed from saved batch_index and batch_size."
+            if legacy_data_state
+            else ""
+        )
+        print(
+            f"resuming at global_step={global_step}, epoch={start_epoch}, "
+            f"samples={samples_completed}/{len(train_loader.dataset)} "
+            f"(current batches={current_batch}/{total_batches}).{legacy_note}",
+            flush=True,
+        )
+        resume_rng_state = checkpoint.get("rng_state")
+        del checkpoint
 
     (output_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
     if wandb_run is not None:
         wandb_run.config.update(dict(config), allow_val_change=True)
         print(f"wandb run: {wandb_run.url}", flush=True)
+    if isinstance(resume_rng_state, Mapping):
+        restore_rng_state(resume_rng_state)
     total_epochs = int(config["training"].get("epochs", 50))
+    current_epoch = start_epoch
+    train_epoch_complete = False
     try:
         for epoch in range(start_epoch, total_epochs + 1):
+            current_epoch = epoch
+            if int(training_state.get("data_epoch", epoch)) != epoch:
+                training_state["data_epoch"] = epoch
+                training_state["samples_completed_in_epoch"] = 0
+                training_state["batches_completed_in_epoch"] = 0
+                training_state["sampler_permutation_seed"] = None
+                training_state["legacy_sampler_seed"] = False
+            configure_loader_epoch(
+                train_loader,
+                epoch,
+                int(training_state.get("samples_completed_in_epoch", 0)),
+                permutation_seed=training_state.get("sampler_permutation_seed"),
+                legacy_global_seed=bool(training_state.get("legacy_sampler_seed", False)),
+            )
+            train_epoch_complete = False
             train_metrics = run_epoch(
                 model,
                 plan_encoder,
@@ -861,6 +1067,7 @@ def main() -> None:
                 training_state,
                 output_dir,
             )
+            train_epoch_complete = True
             print(f"epoch={epoch} train={train_metrics}", flush=True)
             if wandb_run is not None:
                 wandb_run.log({f"epoch/train_{name}": value for name, value in train_metrics.items()} | {"epoch": epoch})
@@ -903,10 +1110,45 @@ def main() -> None:
             global_step=final_step,
             config=config,
             epoch_complete=True,
+            data_state=checkpoint_data_state(
+                train_loader,
+                total_epochs,
+                len(train_loader.dataset),
+                int(training_state.get("batches_completed_in_epoch", len(train_loader))),
+            ),
             name="final.pt",
         )
         training_state["last_saved_step"] = final_step
         print(f"saved final checkpoint: {final_path}", flush=True)
+    except BaseException:
+        emergency_step = int(training_state.get("global_step", 0))
+        if emergency_step > int(training_state.get("last_saved_step", 0)):
+            try:
+                emergency_path = save_step_checkpoint(
+                    output_dir,
+                    model,
+                    plan_encoder,
+                    optimizer,
+                    scaler,
+                    scheduler,
+                    ema,
+                    epoch=current_epoch,
+                    batch_index=int(training_state.get("batches_completed_in_epoch", 0)),
+                    global_step=emergency_step,
+                    config=config,
+                    epoch_complete=train_epoch_complete,
+                    data_state=checkpoint_data_state(
+                        train_loader,
+                        current_epoch,
+                        int(training_state.get("samples_completed_in_epoch", 0)),
+                        int(training_state.get("batches_completed_in_epoch", 0)),
+                    ),
+                )
+                training_state["last_saved_step"] = emergency_step
+                print(f"saved emergency checkpoint: {emergency_path}", flush=True)
+            except Exception as checkpoint_error:
+                print(f"failed to save emergency checkpoint: {checkpoint_error}", flush=True)
+        raise
     finally:
         if wandb_run is not None:
             wandb_run.finish()

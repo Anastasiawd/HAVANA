@@ -11,10 +11,11 @@ log_level: INFO
 
 fast:
   config_path: /home/csevolunt/dongzhih/HAVANA/fast_system/configs/plan_stage2.yaml
-  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2/last.pt
-  cfm_steps: 5
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2_single_rgbd_time_strat3/last.pt
+  cfm_steps: 8
   num_trajectory_samples: 1
   use_amp: true
+  observation_fps: 30.0
 
 slow:
   enabled: true

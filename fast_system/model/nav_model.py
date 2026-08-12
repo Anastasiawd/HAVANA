@@ -208,7 +208,7 @@ class Stage2VisionEncoder(nn.Module):
 
     def __init__(
         self,
-        context_size: int = 3,
+        context_size: int = 0,
         obs_encoder: str = "efficientnet-b0",
         obs_encoding_size: int = 256,
         plan_dim: int = 384,
@@ -465,7 +465,7 @@ def build_fast_nav_model(cfg: Mapping[str, Any] | None = None) -> FastNavModel:
     depth_token_dim = getattr(depth_encoder, "out_dim", int(depth_cfg.get("out_dim", 1024))) if depth_encoder else int(depth_cfg.get("out_dim", 1024))
 
     encoding_size = int(cfg.get("encoding_size", vision_cfg.get("obs_encoding_size", 256)))
-    context_size = int(cfg.get("context_size", vision_cfg.get("context_size", 3)))
+    context_size = int(cfg.get("context_size", vision_cfg.get("context_size", 0)))
     plan_dim = int(cfg.get("plan_dim", cfg.get("z_dim", 384)))
     vision_encoder = Stage2VisionEncoder(
         context_size=context_size,

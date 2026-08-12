@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 try:
     from decord import VideoReader, cpu
@@ -154,6 +154,115 @@ class _ParquetCache:
 _PARQUET_CACHE = _ParquetCache()
 
 
+class ResumableEpochSampler(Sampler[int]):
+    """Deterministic epoch shuffle with an O(1) checkpoint cursor.
+
+    DataLoader prefetch can advance a sampler beyond the last batch that has
+    actually completed optimization.  Consequently the sampler itself does
+    not mutate a cursor while iterating.  The trainer checkpoints the number
+    of *completed samples* and supplies it again through ``set_epoch``.
+    """
+
+    def __init__(
+        self,
+        data_source: Dataset,
+        *,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        self.data_source = data_source
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 1
+        self.start_index = 0
+        self.permutation_seed: int | None = None
+        self.legacy_global_seed = False
+
+    @property
+    def dataset_size(self) -> int:
+        return len(self.data_source)
+
+    def set_epoch(
+        self,
+        epoch: int,
+        start_index: int = 0,
+        *,
+        permutation_seed: int | None = None,
+        legacy_global_seed: bool = False,
+    ) -> None:
+        start_index = int(start_index)
+        if not 0 <= start_index <= self.dataset_size:
+            raise ValueError(
+                f"Sampler start_index must be in [0, {self.dataset_size}], got {start_index}."
+            )
+        self.epoch = int(epoch)
+        self.start_index = start_index
+        self.permutation_seed = None if permutation_seed is None else int(permutation_seed)
+        self.legacy_global_seed = bool(legacy_global_seed)
+
+    def __iter__(self):
+        if self.shuffle:
+            if self.permutation_seed is None:
+                if self.legacy_global_seed:
+                    # Compatibility with torch RandomSampler used by old
+                    # checkpoints. DataLoader consumes its base seed first;
+                    # this is the same second global RNG draw RandomSampler
+                    # used to seed the epoch permutation.
+                    self.permutation_seed = int(
+                        torch.empty((), dtype=torch.int64).random_().item()
+                    )
+                else:
+                    self.permutation_seed = self.seed + self.epoch - 1
+            generator = torch.Generator()
+            # Keep every epoch stable across restarts without materializing a
+            # 700k-entry permutation in each 1.7 GB model checkpoint.
+            generator.manual_seed(self.permutation_seed)
+            indices = torch.randperm(self.dataset_size, generator=generator).tolist()
+        else:
+            indices = range(self.dataset_size)
+        return iter(indices[self.start_index :])
+
+    def __len__(self) -> int:
+        return self.dataset_size - self.start_index
+
+    def state_dict(self) -> dict[str, int | bool | None]:
+        return {
+            "version": 1,
+            "epoch": self.epoch,
+            "start_index": self.start_index,
+            "dataset_size": self.dataset_size,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+            "permutation_seed": self.permutation_seed,
+        }
+
+
+def _normalize_offset_bins(
+    offset_bins: Sequence[Sequence[int]] | None,
+    allowed_offsets: Sequence[int],
+) -> tuple[tuple[int, ...], ...]:
+    """Validate stratified FastNav offset bins while preserving their order."""
+
+    if not offset_bins:
+        return ()
+    allowed = set(int(value) for value in allowed_offsets)
+    normalized: list[tuple[int, ...]] = []
+    seen: set[int] = set()
+    for index, values in enumerate(offset_bins):
+        group = tuple(int(value) for value in values)
+        if not group:
+            raise ValueError(f"fast_offset_bins[{index}] must not be empty.")
+        if any(value not in allowed for value in group):
+            raise ValueError(
+                f"fast_offset_bins[{index}]={group} contains values outside fast_offsets={sorted(allowed)}."
+            )
+        if seen.intersection(group):
+            raise ValueError("fast_offset_bins must be disjoint.")
+        seen.update(group)
+        normalized.append(group)
+    return tuple(normalized)
+
+
 class InternDataFastDataset(Dataset):
     """Fast-policy RGB-D/action samples from a plan JSONL manifest.
 
@@ -166,9 +275,11 @@ class InternDataFastDataset(Dataset):
         self,
         manifest: str | Path,
         obs_image_size: int = 256,
-        context_size: int = 3,
+        context_size: int = 0,
         action_horizon: int = 16,
         async_offsets: Sequence[int] = tuple(range(1, 13)),
+        offset_bins: Sequence[Sequence[int]] | None = None,
+        randomize_offsets: bool = False,
         target_fps: float = 10.0,
         obs_context_dt_frames: int = 1,
         pose_key: str = "action",
@@ -185,6 +296,10 @@ class InternDataFastDataset(Dataset):
         self.context_size = int(context_size)
         self.action_horizon = int(action_horizon)
         self.async_offsets = tuple(int(value) for value in async_offsets)
+        if not self.async_offsets or any(value <= 0 for value in self.async_offsets):
+            raise ValueError("async_offsets must contain positive native-frame offsets.")
+        self.offset_bins = _normalize_offset_bins(offset_bins, self.async_offsets)
+        self.randomize_offsets = bool(randomize_offsets)
         self.target_fps = float(target_fps)
         self.obs_context_dt_frames = max(1, int(obs_context_dt_frames))
         self.pose_key = str(pose_key)
@@ -205,6 +320,17 @@ class InternDataFastDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def _select_async_offsets(self) -> tuple[int, ...]:
+        """Choose one native-frame offset per configured temporal stratum."""
+
+        if not self.offset_bins:
+            return self.async_offsets
+        if self.randomize_offsets:
+            return tuple(random.choice(group) for group in self.offset_bins)
+        # Validation is deterministic and uses the lower midpoint of each bin:
+        # [1,2,3,4], [5,6,7,8], [9,10,11,12] -> [2,6,10].
+        return tuple(group[(len(group) - 1) // 2] for group in self.offset_bins)
+
     def _load_video_and_poses(self, record: Mapping[str, Any]):
         if VideoReader is None:
             raise ImportError("decord is required to read InternData RGB videos.")
@@ -218,14 +344,26 @@ class InternDataFastDataset(Dataset):
         count = min(len(reader), len(dataframe))
         return reader, dataframe, pose_key, count
 
-    def _build_fast_fields(self, record: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    def _build_fast_fields(
+        self,
+        record: Mapping[str, Any],
+        async_offsets: Sequence[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
         reader, dataframe, pose_key, total_frames = self._load_video_and_poses(record)
         reference_frame = int(record["reference_frame"])
+        selected_offsets = tuple(
+            int(value) for value in (self.async_offsets if async_offsets is None else async_offsets)
+        )
+        if not selected_offsets:
+            raise ValueError("At least one FastNav offset must be selected.")
+        source_fps = float(record.get("source_fps", 0.0))
+        if not math.isfinite(source_fps) or source_fps <= 0:
+            raise ValueError("FastNav records require a positive source_fps for time conditioning.")
 
         video_path = Path(record["video_path"]).expanduser()
         # FastNav runs at the native stream rate: offset=1 means exactly the
         # next recorded frame, regardless of the source FPS.
-        current_indices = [reference_frame + offset for offset in self.async_offsets]
+        current_indices = [reference_frame + offset for offset in selected_offsets]
         all_obs_indices = {
             min(max(current - step * self.obs_context_dt_frames, 0), total_frames - 1)
             for current in current_indices
@@ -245,7 +383,7 @@ class InternDataFastDataset(Dataset):
         action_groups: list[torch.Tensor] = []
         mask_groups: list[torch.Tensor] = []
         distances: list[torch.Tensor] = []
-        for offset in self.async_offsets:
+        for offset in selected_offsets:
             current = reference_frame + offset
             obs_indices = np.asarray(
                 [current - step * self.obs_context_dt_frames for step in range(self.context_size, -1, -1)],
@@ -282,7 +420,11 @@ class InternDataFastDataset(Dataset):
             "action": torch.stack(action_groups),
             "action_mask": torch.stack(mask_groups),
             "distance": torch.stack(distances),
-            "async_offsets": torch.tensor(self.async_offsets, dtype=torch.long),
+            "async_offsets": torch.tensor(selected_offsets, dtype=torch.long),
+            # Seconds elapsed since the Reason1 reference observation.  Keep
+            # this separate from native-frame offsets so mixed FPS data cannot
+            # silently corrupt the trajectory-anchor time embedding.
+            "plan_times": torch.tensor(selected_offsets, dtype=torch.float32) / source_fps,
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -297,7 +439,7 @@ class InternDataFastDataset(Dataset):
         }:
             raise ValueError(f"Invalid plan schema in {plan_path}.")
 
-        fast_fields = self._build_fast_fields(record)
+        fast_fields = self._build_fast_fields(record, self._select_async_offsets())
         reference_frame = int(record["reference_frame"])
 
         return {
@@ -448,9 +590,13 @@ class InternDataOnlinePlanDataset(InternDataFastDataset):
         self.native_dataset = build_native_intern_dataset(data_cfg, split)
         image_size = int(data_cfg.get("obs_image_size", 256))
         self.size = (image_size, image_size)
-        self.context_size = int(data_cfg.get("context_size", 3))
+        self.context_size = int(data_cfg.get("context_size", 0))
         self.action_horizon = int(data_cfg.get("action_horizon", 16))
         self.async_offsets = tuple(int(value) for value in data_cfg.get("fast_offsets", tuple(range(1, 13))))
+        if not self.async_offsets or any(value <= 0 for value in self.async_offsets):
+            raise ValueError("fast_offsets must contain positive native-frame offsets.")
+        self.offset_bins = _normalize_offset_bins(data_cfg.get("fast_offset_bins"), self.async_offsets)
+        self.randomize_offsets = split == "train"
         self.target_fps = float(data_cfg.get("target_fps", 10.0))
         self.obs_context_dt_frames = max(1, int(data_cfg.get("obs_context_dt_frames", 1)))
         self.pose_key = str(data_cfg.get("pose_key", "action"))
@@ -516,9 +662,12 @@ class InternDataOnlinePlanDataset(InternDataFastDataset):
             "pose_key": self.native_dataset.pose_key,
             "reference_frame": int(frame_indices[4]),
         }
-        fast_fields = self._build_fast_fields(record)
+        fast_fields = self._build_fast_fields(record, self._select_async_offsets())
         return {
-            "reason_video": torch.as_tensor(item["video"]).to(dtype=torch.uint8),
+            # TrajectoryReason1Encoder indexes condition positions 0..4 only.
+            # Do not send the twelve unused future frames through the worker
+            # queue/shared-memory batch.
+            "reason_video": torch.as_tensor(item["video"])[:, :5].to(dtype=torch.uint8).contiguous(),
             "instruction": str(item["ai_caption"]),
             **fast_fields,
             "metadata": {
@@ -546,7 +695,16 @@ def collate_plan_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         context[row, :length] = item["reason_context"]
         mask[row, :length] = item["context_mask"]
     batch = {"reason_context": context, "context_mask": mask}
-    for key in ("traj_latents", "obs", "depth", "action", "action_mask", "distance", "async_offsets"):
+    for key in (
+        "traj_latents",
+        "obs",
+        "depth",
+        "action",
+        "action_mask",
+        "distance",
+        "async_offsets",
+        "plan_times",
+    ):
         batch[key] = torch.stack([item[key] for item in items])
     batch["metadata"] = [item["metadata"] for item in items]
     return batch
@@ -561,7 +719,16 @@ def collate_online_plan_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         "instruction": [str(item["instruction"]) for item in items],
         "metadata": [item["metadata"] for item in items],
     }
-    for key in ("reason_video", "obs", "depth", "action", "action_mask", "distance", "async_offsets"):
+    for key in (
+        "reason_video",
+        "obs",
+        "depth",
+        "action",
+        "action_mask",
+        "distance",
+        "async_offsets",
+        "plan_times",
+    ):
         batch[key] = torch.stack([item[key] for item in items])
     return batch
 
@@ -575,9 +742,11 @@ def build_intern_plan_dataloader(
     dataset = InternDataFastDataset(
         manifest=manifest,
         obs_image_size=int(data_cfg.get("obs_image_size", 256)),
-        context_size=int(data_cfg.get("context_size", 3)),
+        context_size=int(data_cfg.get("context_size", 0)),
         action_horizon=int(data_cfg.get("action_horizon", 16)),
         async_offsets=data_cfg.get("fast_offsets", tuple(range(1, 13))),
+        offset_bins=data_cfg.get("fast_offset_bins"),
+        randomize_offsets=split == "train",
         target_fps=float(data_cfg.get("target_fps", 10.0)),
         obs_context_dt_frames=int(data_cfg.get("obs_context_dt_frames", 1)),
         pose_key=str(data_cfg.get("pose_key", "action")),
@@ -589,13 +758,19 @@ def build_intern_plan_dataloader(
     workers = int(loader_cfg.get("num_workers", 4))
     shuffle = bool(loader_cfg.get("shuffle", split == "train")) if split == "train" else False
     drop_last = bool(loader_cfg.get("drop_last", False)) if split == "train" else False
+    sampler = ResumableEpochSampler(
+        dataset,
+        shuffle=shuffle,
+        seed=int(data_cfg.get("seed", 0)),
+    )
     return DataLoader(
         dataset,
         batch_size=int(loader_cfg.get("batch_size", 8)),
-        shuffle=shuffle,
+        sampler=sampler,
         num_workers=workers,
         pin_memory=bool(loader_cfg.get("pin_memory", True)),
         persistent_workers=bool(loader_cfg.get("persistent_workers", workers > 0)) and workers > 0,
+        prefetch_factor=int(loader_cfg.get("prefetch_factor", 2)) if workers > 0 else None,
         drop_last=drop_last,
         collate_fn=collate_plan_batch,
     )
@@ -610,13 +785,19 @@ def build_intern_online_dataloader(
     workers = int(loader_cfg.get("num_workers", 4))
     shuffle = bool(loader_cfg.get("shuffle", split == "train")) if split == "train" else False
     drop_last = bool(loader_cfg.get("drop_last", False)) if split == "train" else False
+    sampler = ResumableEpochSampler(
+        dataset,
+        shuffle=shuffle,
+        seed=int(data_cfg.get("seed", 0)),
+    )
     return DataLoader(
         dataset,
         batch_size=int(loader_cfg.get("batch_size", 1)),
-        shuffle=shuffle,
+        sampler=sampler,
         num_workers=workers,
         pin_memory=bool(loader_cfg.get("pin_memory", True)),
         persistent_workers=bool(loader_cfg.get("persistent_workers", workers > 0)) and workers > 0,
+        prefetch_factor=int(loader_cfg.get("prefetch_factor", 2)) if workers > 0 else None,
         drop_last=drop_last,
         collate_fn=collate_online_plan_batch,
         multiprocessing_context="spawn" if workers > 0 else None,

@@ -16,10 +16,11 @@ log_level: INFO
 # --- Fast (PlanEncoder + RGB Stage-2) -------------------------------------
 fast:
   config_path: /home/csevolunt/dongzhih/HAVANA/fast_system/configs/plan_stage2.yaml
-  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2/last.pt
-  cfm_steps: 5                      # reduced from 8 for speed
+  checkpoint: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2_single_rgbd_time_strat3/last.pt
+  cfm_steps: 8                      # Euler integration steps for CFM trajectory sampling
   num_trajectory_samples: 1         # reduced from 4 for speed
   use_amp: true
+  observation_fps: 30.0             # simulator observations per second; used for plan time
 
 # --- Slow (talks to slow_server.py over multiprocessing.connection) -------
 slow:

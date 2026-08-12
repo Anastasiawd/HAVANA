@@ -19,9 +19,10 @@ class PlanEncoder(nn.Module):
 
     The variable-length Cosmos conditioning sequence is distilled into fixed
     route tokens.  The three Reason1 trajectory latent tokens remain distinct
-    and receive both anchor-index and signed time-to-anchor embeddings.  When
-    ``plan_offsets`` is ``[B,O]`` the expensive route encoding is computed once
-    per slow plan and then expanded to the O fast-policy observation times.
+    and receive both anchor-index and signed time-to-anchor embeddings.  All
+    temporal values are expressed in seconds.  When ``plan_times`` is ``[B,O]``
+    the expensive route encoding is computed once per slow plan and then
+    expanded to the O fast-policy observation times.
     """
 
     def __init__(
@@ -31,19 +32,21 @@ class PlanEncoder(nn.Module):
         hidden_dim: int = 384,
         num_route_queries: int = 16,
         num_trajectory_tokens: int = 3,
-        trajectory_anchor_steps: Sequence[int] = (4, 8, 12),
-        time_normalizer: float = 12.0,
+        trajectory_anchor_times: Sequence[float] = (0.4, 0.8, 1.2),
+        time_normalizer_seconds: float = 1.2,
         num_layers: int = 3,
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        anchors = tuple(int(value) for value in trajectory_anchor_steps)
+        anchors = tuple(float(value) for value in trajectory_anchor_times)
         if num_trajectory_tokens != 3 or len(anchors) != num_trajectory_tokens:
             raise ValueError("The plan v2 contract requires three trajectory tokens and three anchors.")
-        if time_normalizer <= 0:
-            raise ValueError("time_normalizer must be positive.")
+        if any(value <= 0 for value in anchors) or any(left >= right for left, right in zip(anchors, anchors[1:])):
+            raise ValueError("trajectory_anchor_times must be positive and strictly increasing.")
+        if time_normalizer_seconds <= 0:
+            raise ValueError("time_normalizer_seconds must be positive.")
 
         self.context_dim = int(context_dim)
         self.trajectory_dim = int(trajectory_dim)
@@ -51,7 +54,7 @@ class PlanEncoder(nn.Module):
         self.num_route_queries = int(num_route_queries)
         self.num_trajectory_tokens = int(num_trajectory_tokens)
         self.num_plan_tokens = self.num_route_queries + self.num_trajectory_tokens
-        self.time_normalizer = float(time_normalizer)
+        self.time_normalizer_seconds = float(time_normalizer_seconds)
 
         self.qformer = RouteQFormer(
             input_dim=self.context_dim,
@@ -74,7 +77,7 @@ class PlanEncoder(nn.Module):
         )
         self.output_norm = nn.LayerNorm(self.hidden_dim)
         self.register_buffer(
-            "trajectory_anchor_steps",
+            "trajectory_anchor_times",
             torch.tensor(anchors, dtype=torch.float32),
             persistent=True,
         )
@@ -93,7 +96,7 @@ class PlanEncoder(nn.Module):
         reason_context: torch.Tensor,
         context_mask: torch.Tensor,
         traj_latents: torch.Tensor,
-        plan_offsets: torch.Tensor | None = None,
+        plan_times: torch.Tensor | None = None,
     ) -> torch.Tensor:
         reason_context = self._batched(reason_context, 3, "reason_context")
         context_mask = self._batched(context_mask, 2, "context_mask")
@@ -122,47 +125,66 @@ class PlanEncoder(nn.Module):
         traj_latents = traj_latents.to(device=device, dtype=dtype)
         route_tokens = self.qformer(reason_context, token_mask=context_mask)
 
-        if plan_offsets is None:
-            offsets = torch.zeros((batch_size, 1), device=device, dtype=dtype)
-            squeeze_offsets = True
+        if plan_times is None:
+            observation_times = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+            squeeze_times = True
         else:
-            offsets = torch.as_tensor(plan_offsets, device=device, dtype=dtype)
-            if offsets.ndim == 1:
-                offsets = offsets.unsqueeze(1)
-                squeeze_offsets = True
-            elif offsets.ndim == 2:
-                squeeze_offsets = False
+            observation_times = torch.as_tensor(plan_times, device=device, dtype=dtype)
+            if observation_times.ndim == 1:
+                observation_times = observation_times.unsqueeze(1)
+                squeeze_times = True
+            elif observation_times.ndim == 2:
+                squeeze_times = False
             else:
-                raise ValueError(f"plan_offsets must be [B] or [B,O], got {tuple(offsets.shape)}.")
-            if offsets.shape[0] != batch_size:
-                raise ValueError(f"plan_offsets batch {offsets.shape[0]} does not match {batch_size}.")
+                raise ValueError(
+                    f"plan_times must be seconds with shape [B] or [B,O], got {tuple(observation_times.shape)}."
+                )
+            if observation_times.shape[0] != batch_size:
+                raise ValueError(f"plan_times batch {observation_times.shape[0]} does not match {batch_size}.")
+            if not torch.isfinite(observation_times).all() or (observation_times < 0).any():
+                raise ValueError("plan_times must contain finite non-negative seconds.")
 
-        num_offsets = int(offsets.shape[1])
-        route_tokens = route_tokens[:, None].expand(-1, num_offsets, -1, -1)
+        num_times = int(observation_times.shape[1])
+        route_tokens = route_tokens[:, None].expand(-1, num_times, -1, -1)
         trajectory_tokens = self.trajectory_proj(traj_latents)
         token_ids = torch.arange(self.num_trajectory_tokens, device=device)
         trajectory_tokens = trajectory_tokens + self.trajectory_index_embed(token_ids).unsqueeze(0)
-        trajectory_tokens = trajectory_tokens[:, None].expand(-1, num_offsets, -1, -1)
+        trajectory_tokens = trajectory_tokens[:, None].expand(-1, num_times, -1, -1)
 
-        relative_steps = self.trajectory_anchor_steps.to(device=device, dtype=dtype).view(1, 1, -1)
-        relative_steps = (relative_steps - offsets.unsqueeze(-1)) / self.time_normalizer
-        trajectory_tokens = trajectory_tokens + self.time_embed(relative_steps.unsqueeze(-1))
+        relative_times = self.trajectory_anchor_times.to(device=device, dtype=dtype).view(1, 1, -1)
+        relative_times = (
+            relative_times - observation_times.unsqueeze(-1)
+        ) / self.time_normalizer_seconds
+        trajectory_tokens = trajectory_tokens + self.time_embed(relative_times.unsqueeze(-1))
         plan_tokens = self.output_norm(torch.cat((route_tokens, trajectory_tokens), dim=2))
-        if squeeze_offsets:
+        if squeeze_times:
             return plan_tokens[:, 0]
         return plan_tokens
 
 
 def build_plan_encoder(cfg: Mapping[str, Any] | None = None) -> PlanEncoder:
     cfg = {} if cfg is None else cfg
+    legacy_anchor_steps = cfg.get("trajectory_anchor_steps")
+    if "trajectory_anchor_times" in cfg:
+        anchor_times = cfg["trajectory_anchor_times"]
+        time_normalizer_seconds = float(cfg.get("time_normalizer_seconds", 1.2))
+    elif legacy_anchor_steps is not None:
+        anchor_fps = float(cfg.get("trajectory_anchor_fps", 10.0))
+        if anchor_fps <= 0:
+            raise ValueError("trajectory_anchor_fps must be positive.")
+        anchor_times = [float(value) / anchor_fps for value in legacy_anchor_steps]
+        time_normalizer_seconds = float(cfg.get("time_normalizer", 12.0)) / anchor_fps
+    else:
+        anchor_times = (0.4, 0.8, 1.2)
+        time_normalizer_seconds = float(cfg.get("time_normalizer_seconds", 1.2))
     return PlanEncoder(
         context_dim=int(cfg.get("context_dim", 1024)),
         trajectory_dim=int(cfg.get("trajectory_dim", 3584)),
         hidden_dim=int(cfg.get("hidden_dim", 384)),
         num_route_queries=int(cfg.get("num_route_queries", 16)),
         num_trajectory_tokens=int(cfg.get("num_trajectory_tokens", 3)),
-        trajectory_anchor_steps=cfg.get("trajectory_anchor_steps", (4, 8, 12)),
-        time_normalizer=float(cfg.get("time_normalizer", 12.0)),
+        trajectory_anchor_times=anchor_times,
+        time_normalizer_seconds=time_normalizer_seconds,
         num_layers=int(cfg.get("num_layers", 3)),
         num_heads=int(cfg.get("num_heads", 6)),
         mlp_ratio=float(cfg.get("mlp_ratio", 4.0)),

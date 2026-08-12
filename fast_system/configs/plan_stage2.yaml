@@ -6,16 +6,16 @@ wandb:
   mode: online
   project: havana-fast-nav
   entity: null
-  name: havana-plan-stage2-online-bs4
+  name: havana-plan-stage2-single-rgbd-time-strat3-resumable-v2
   group: reason1-plan-conditioning
-  tags: [online-reason1, frozen-reason1, batch-4]
+  tags: [online-reason1, frozen-reason1, single-rgbd, time-seconds, stratified-offsets, batch-16]
   log_every: 1
 
 online_reason1:
   checkpoint: /home/csevolunt/dongzhih/cosmos-predict2.5/runs/cosmos_predict_v2p5/video2world_vln/2b_vln_temporal_wp_17f_full_finetune/checkpoints/iter_000060000/model.pt
   experiment: predict2_video2world_training_2b_vln_temporal_waypoint_17f_full_finetune
   config_file: ""
-  log_interval: 10
+  log_interval: 100
 
 plan_encoder:
   context_dim: 1024
@@ -23,8 +23,10 @@ plan_encoder:
   hidden_dim: 384
   num_route_queries: 16
   num_trajectory_tokens: 3
-  trajectory_anchor_steps: [4, 8, 12]
-  time_normalizer: 12.0
+  # Reason1 trajectory latents are anchored 0.4/0.8/1.2 seconds after the
+  # reference observation. PlanEncoder time conditioning uses seconds end to end.
+  trajectory_anchor_times: [0.4, 0.8, 1.2]
+  time_normalizer_seconds: 1.2
   num_layers: 3
   num_heads: 6
   mlp_ratio: 4.0
@@ -32,7 +34,9 @@ plan_encoder:
 
 model:
   encoding_size: 256
-  context_size: 3
+  # FastNav reacts to the current RGB-D observation only. Reason1 owns the
+  # temporal history used to produce the plan tokens.
+  context_size: 0
   plan_dim: 384
   action_dim: 3
   action_horizon: 16
@@ -77,14 +81,21 @@ intern_data:
   train_manifest: /home/csevolunt/dongzhih/HAVANA/fast_system/data/plan_latents/train_manifest.jsonl
   val_manifest: /home/csevolunt/dongzhih/HAVANA/fast_system/data/plan_latents/val_manifest.jsonl
   obs_image_size: 256
-  context_size: 3
+  # Zero history frames: each FastNav tick loads only its current RGB frame.
+  context_size: 0
   action_horizon: 16
   # Reason1 alone uses a fixed 10 FPS temporal window. FastNav consumes every
   # native source frame after the Reason1 reference frame (no downsampling).
   target_fps: 10.0
   obs_context_dt_frames: 1
-  # Native-frame offsets: one Reason1 plan at t supervises every t+1..t+12.
+  # Native-frame candidate offsets spanning t+1..t+12 without downsampling.
   fast_offsets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  # Draw one offset from each near/mid/far stratum for every training access.
+  # Validation deterministically uses the lower midpoint: [2, 6, 10].
+  fast_offset_bins:
+    - [1, 2, 3, 4]
+    - [5, 6, 7, 8]
+    - [9, 10, 11, 12]
   min_depth_m: 0.1
   max_depth_m: 5.0
   require_full_horizon: true
@@ -97,12 +108,16 @@ intern_data:
   max_samples: null
 
 dataloader:
-  # Four plans become 48 FastNav samples after t+1..t+12 flattening.
-  batch_size: 4
+  # Sixteen independent plans become 48 FastNav samples after stratified
+  # flattening, matching the old bs4 x 12-offset FastNav sample count while
+  # taking advantage of the much cheaper single-frame RGB-D observation.
+  batch_size: 16
   shuffle: true
-  num_workers: 4
-  pin_memory: true
-  persistent_workers: true
+  # Decode in the training process. This removes the multiprocessing shared-
+  # memory transport which was receiving SIGBUS after several thousand steps.
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
   drop_last: false
 
 ema:
@@ -115,8 +130,8 @@ ema:
   max_value: 0.9999
 
 training:
-  output_dir: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2
-  epochs: 50
+  output_dir: /home/csevolunt/dongzhih/HAVANA/fast_system/checkpoints/plan_stage2_single_rgbd_time_strat3_resumable_v2
+  epochs: 5
   lr: 0.0001
   lr_scheduler: constant
   lr_warmup_steps: 500
